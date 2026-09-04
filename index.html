@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RecoverAI — AI Revenue Recovery</title>
+  <meta name="description" content="RecoverAI identifies revenue at risk, predicts recoverability, and recommends the best recovery action." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%230b1633'/%3E%3Cpath d='M22 68V31l28-15v52' fill='none' stroke='%237ee0c4' stroke-width='10' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M50 68V31l28 15v22' fill='none' stroke='%236aa8ff' stroke-width='10' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="toast-root"></div>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><span>R</span></div>
+        <div>
+          <div class="brand-name">Recover<span>AI</span></div>
+          <div class="brand-sub">Revenue Recovery OS</div>
+        </div>
+      </div>
+
+      <div class="merchant-card">
+        <div class="merchant-avatar">AC</div>
+        <div class="merchant-copy">
+          <strong>Acme Commerce</strong>
+          <span>Growth plan</span>
+        </div>
+        <button class="icon-btn" aria-label="Switch merchant">⌄</button>
+      </div>
+
+      <nav class="nav" id="main-nav">
+        <button class="nav-item active" data-route="dashboard"><span class="nav-icon">◈</span>Overview</button>
+        <button class="nav-item" data-route="payments"><span class="nav-icon">↗</span>Failed payments</button>
+        <button class="nav-item" data-route="agent"><span class="nav-icon">✦</span>AI agent <em>LIVE</em></button>
+        <button class="nav-item" data-route="simulator"><span class="nav-icon">⌁</span>Recovery simulator</button>
+        <button class="nav-item" data-route="settings"><span class="nav-icon">⚙</span>Settings</button>
+      </nav>
+
+      <div class="sidebar-bottom">
+        <div class="agent-status-card">
+          <div class="status-row"><span class="dot live"></span><strong>Recovery Agent active</strong></div>
+          <p>Watching failed payments and prioritizing the highest-value recoveries.</p>
+          <button class="ghost-btn" data-route="agent">Open agent →</button>
+        </div>
+        <div class="user-row">
+          <div class="user-avatar">AK</div>
+          <div><strong>Aadi Kumar</strong><span>Merchant admin</span></div>
+          <button class="icon-btn" aria-label="More">•••</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <div class="breadcrumb">ACME COMMERCE <span>/</span> <strong id="page-kicker">OVERVIEW</strong></div>
+          <h1 id="page-title">Revenue recovery command center</h1>
+        </div>
+        <div class="topbar-actions">
+          <button class="date-btn">Last 30 days <span>⌄</span></button>
+          <button class="outline-btn" id="simulate-failure-btn">+ Simulate failed payment</button>
+          <button class="primary-btn" data-route="agent">Ask AI <span>↗</span></button>
+        </div>
+      </header>
+
+      <section id="page" class="page"></section>
+    </main>
+  </div>
+
+  <div id="modal-root"></div>
+  <script src="app.js"></script>
+</body>
+</html>

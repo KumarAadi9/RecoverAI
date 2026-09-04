@@ -1,0 +1,9 @@
+{
+  "name": "recoverai",
+  "version": "3.0.0",
+  "private": true,
+  "description": "RecoverAI — AI Revenue Recovery platform",
+  "scripts": {
+    "serve": "python -m uvicorn backend.main:app --reload --port 8000"
+  }
+}
