@@ -846,21 +846,22 @@ def payment_action(
     if success:
 
         conn.execute(
+        """
+        UPDATE payments
 
-            """
-            UPDATE payments
+        SET
 
-            SET
+            status='recovered',
 
-                status='recovered',
+            recovered_value=amount,
 
-                recovered_value=amount
+            recoverable_value=0
 
-            WHERE payment_id=?
-            """,
+        WHERE payment_id=?
+        """,
 
-            (payment_id,),
-        )
+        (payment_id,),
+    )
 
     conn.commit()
 

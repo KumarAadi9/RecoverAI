@@ -1155,19 +1155,81 @@ function openEventTrace(type, detail, amount){
 
     </div>
   `;
+                
 
   document.querySelector('#close-event-modal').onclick = closeModal;
   document.querySelector('#dismiss-event-modal').onclick = closeModal;
 
-  document.querySelector('#execute-trace-action').onclick = () => {
+  document.querySelector('#execute-trace-action').onclick = async () => {
 
-    closeModal();
+    const button =
+        document.querySelector('#execute-trace-action');
 
-    toast(
-      `AI action executed — ${action} for ${money(amount)} payment opportunity.`
-    );
+    if (button) {
+        button.disabled = true;
+        button.textContent = 'Executing…';
+    }
 
-  };
+    try {
+
+        // Find the payment associated with this event.
+        const payment = state.payments.find(
+            p => Number(p.amount) === Number(amount)
+        );
+
+        if (!payment) {
+            throw new Error(
+                'Could not identify the payment for this event.'
+            );
+        }
+
+        const result = await api(
+            `/payments/${payment.id}/action`,
+            {
+                method: 'POST',
+                body: JSON.stringify({
+                    action: payment.recommended
+                })
+            }
+        );
+
+        closeModal();
+
+        await syncFromBackend();
+
+        if (result.result === 'recovered') {
+
+            toast(
+                `${payment.id} recovered — ${money(payment.amount)} added to recovered revenue.`
+            );
+
+        } else if (result.result === 'escalated') {
+
+            toast(
+                `${payment.id} escalated for merchant approval.`
+            );
+
+        } else {
+
+            toast(
+                `${payment.id}: no recovery action executed.`
+            );
+        }
+
+    } catch (error) {
+
+        console.error(error);
+
+        toast(
+            `Recovery action failed: ${error.message}`
+        );
+
+        if (button) {
+            button.disabled = false;
+            button.textContent = 'Execute action';
+        }
+    }
+};
 }
 
 // Global interactions
@@ -1181,3 +1243,4 @@ document.querySelector(
 render();
 
 syncFromBackend();
+
