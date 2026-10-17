@@ -4,7 +4,11 @@ DEFAULT_POLICY = {
     'auto_recovery': True,
     'high_value_approval': True,
     'high_value_threshold': 100000,
-    'recovery_threshold': 0.60,
+    # Confidence floor for automatic action. 0.0 means "rely on the expected-value check".
+    # Chosen on a validation set by backend/backtest.py (select_threshold); a strict 0.60 floor
+    # recovers far less revenue because a single retry of a bank decline succeeds well under 60%
+    # of the time even though it is still worth attempting. Raise it to act more conservatively.
+    'recovery_threshold': 0.0,
     'max_retries': 3,
 }
 

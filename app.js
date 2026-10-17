@@ -887,6 +887,12 @@ function openPayment(id){
         `${p.id} escalated for merchant approval.`
       );
 
+    } else if(result.result === 'retry_failed'){
+
+      toast(
+        `${p.id}: recovery attempt failed (retry ${result.payment.retries}).`
+      );
+
     } else {
 
       toast(
@@ -941,7 +947,8 @@ function liveEvents(){
       recovery: '↗',
       success: '✓',
       escalation: '!',
-      no_action: '—'
+      no_action: '—',
+      retry_failed: '✗'
     };
 
     return `
@@ -1207,6 +1214,12 @@ function openEventTrace(type, detail, amount){
 
             toast(
                 `${payment.id} escalated for merchant approval.`
+            );
+
+        } else if (result.result === 'retry_failed') {
+
+            toast(
+                `${payment.id}: recovery attempt failed (retry ${result.payment.retries}).`
             );
 
         } else {

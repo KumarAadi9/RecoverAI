@@ -8,7 +8,6 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "recoverai.db"
-DATA_PATH = ROOT / "payments_50000.json"
 
 
 def get_conn() -> sqlite3.Connection:
@@ -37,6 +36,7 @@ def init_db() -> None:
             recoverable_value REAL NOT NULL,
             recovered_value REAL NOT NULL DEFAULT 0,
             recommended_action TEXT NOT NULL,
+            recommended_delay_h REAL NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -53,6 +53,11 @@ def init_db() -> None:
         """
     )
 
+    # Databases created by older versions lack the recommended_delay_h column.
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(payments)")]
+    if "recommended_delay_h" not in cols:
+        conn.execute("ALTER TABLE payments ADD COLUMN recommended_delay_h REAL NOT NULL DEFAULT 0")
+
     count = conn.execute(
         "SELECT COUNT(*) AS n FROM payments"
     ).fetchone()["n"]
@@ -64,113 +69,41 @@ def init_db() -> None:
     conn.close()
 
 
+SEED_PAYMENTS = 5000
+
+
 def seed_from_dataset(conn: sqlite3.Connection) -> None:
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(
-            f"Missing dataset: {DATA_PATH}"
-        )
+    """Fill the demo database with simulated failed payments from the same world the model and
+    the backtest use (see simulation.py). Scores and actions are filled in by
+    ml_engine.rescore_payments() right after."""
+    from . import simulation as sim
 
-    raw = json.loads(
-        DATA_PATH.read_text(encoding="utf-8")
-    )
+    start = sim.now_ist().normalize() - __import__("pandas").Timedelta(days=30)
+    df = sim.generate_failures(SEED_PAYMENTS, seed=2026, start=str(start.date()), days=30)
 
-    # Keep the local demo responsive while still
-    # giving the app thousands of records.
-    rows = raw[:5000]
-
-    for p in rows:
-        prob = float(
-            p.get("recovery_probability", 0.5)
-        )
-
-        amount = float(p["amount"])
-
-        # Seed a small amount of historical recovered
-        # traffic so the dashboard has a meaningful
-        # baseline on first launch.
-        digest = hashlib.sha256(
-            p["payment_id"].encode()
-        ).hexdigest()[:8]
-
-        historical_recovered = (
-            int(digest, 16) % 100
-        ) < int(prob * 12)
-
-        seeded_status = (
-            "recovered"
-            if historical_recovered
-            else "failed"
-        )
-
-        # IMPORTANT:
-        # Historical recovered payments must also
-        # store the amount actually recovered.
-        recovered_value = (
-            amount
-            if historical_recovered
-            else 0
-        )
-
-        # Select the recommended recovery action.
-        if prob >= 0.80:
-            action = "Smart retry"
-
-        elif p["failure_reason"] == "Card expired":
-            action = "Update payment method"
-
-        elif p["failure_reason"] == "Authentication failed":
-            action = "Re-authenticate"
-
-        elif prob >= 0.60:
-            action = "Retry later"
-
-        else:
-            action = "No action"
-
+    for p in df.itertuples():
+        # A small share of payments start out already recovered so the dashboard has a baseline.
+        digest = hashlib.sha256(p.payment_id.encode()).hexdigest()[:8]
+        recovered = (int(digest, 16) % 100) < 8
+        amount = float(p.amount)
         conn.execute(
             """
             INSERT INTO payments(
-                payment_id,
-                customer_id,
-                amount,
-                payment_method,
-                timestamp,
-                status,
-                failure_reason,
-                customer_previous_payments,
-                customer_success_rate,
-                retry_count,
-                recovery_probability,
-                recoverable_value,
-                recovered_value,
-                recommended_action
-            )
-            VALUES(
-                ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?
-            )
+                payment_id, customer_id, amount, payment_method, timestamp, status,
+                failure_reason, customer_previous_payments, customer_success_rate,
+                retry_count, recovery_probability, recoverable_value, recovered_value,
+                recommended_action, recommended_delay_h
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                p["payment_id"],
-                p["customer_id"],
-                amount,
-                p["payment_method"],
-                p["timestamp"],
-                seeded_status,
-                p["failure_reason"],
-                int(p["customer_previous_payments"]),
-                float(p["customer_success_rate"]),
-                int(p.get("retry_count", 0))
-                + (1 if historical_recovered else 0),
-                prob,
-                float(
-                    p.get(
-                        "recoverable_value",
-                        amount * prob
-                    )
-                ),
-                recovered_value,
-                action,
+                p.payment_id, p.customer_id, amount, p.payment_method,
+                p.timestamp.tz_localize("Asia/Kolkata").isoformat(),
+                "recovered" if recovered else "failed",
+                p.failure_reason, int(p.customer_previous_payments),
+                float(p.customer_success_rate),
+                1 if recovered else 0,
+                0.5, 0.0 if recovered else amount * 0.5, amount if recovered else 0,
+                "No action", 0.0,
             ),
         )
 

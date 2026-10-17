@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +12,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .db import get_conn, init_db, insert_event
+import numpy as np
+import pandas as pd
+
 from . import ml_engine
+from . import simulation as sim
 from .policy import decide, DEFAULT_POLICY
 
 
@@ -52,6 +57,15 @@ class ActionRequest(BaseModel):
     action: str
 
 
+# Recovery attempts succeed with the modelled probability. Set RECOVERAI_SEED to make
+# runs reproducible (used by the tests).
+_seed = os.environ.get("RECOVERAI_SEED")
+OUTCOME_RNG = random.Random(int(_seed)) if _seed else random.Random()
+
+# How many payments one agent cycle may act on.
+AGENT_BATCH_SIZE = 20
+
+
 # =========================================================
 # STARTUP
 # =========================================================
@@ -60,6 +74,8 @@ class ActionRequest(BaseModel):
 def startup() -> None:
     init_db()
     ml_engine.ensure_model()
+    # Replace the dataset's generated probability with the trained model's score.
+    ml_engine.rescore_payments()
 
 
 # =========================================================
@@ -377,37 +393,18 @@ def metrics():
 # RECOVERY OUTCOME
 # =========================================================
 
-def outcome_probability(
-    action: str,
-    model_prob: float,
-) -> float:
-    """
-    Calculate the simulated success probability
-    based on the selected recovery action.
-    """
+def world_success_probability(row: dict, action: str) -> float:
+    """True chance that this action succeeds right now, from the simulated world (simulation.py).
 
-    offsets = {
-
-        "Smart retry": 0.03,
-
-        "Retry later": 0.00,
-
-        "Update payment method": 0.04,
-
-        "Re-authenticate": -0.02,
-    }
-
-    return max(
-        0.05,
-        min(
-            0.98,
-            model_prob
-            + offsets.get(
-                action,
-                0.0,
-            ),
-        ),
-    )
+    The model only *estimates* this; execution in the demo is drawn from the world itself, so a
+    recommendation can turn out wrong, as it would in real life."""
+    kind = ml_engine.LABEL_KIND.get(action, "retry")
+    pay = pd.DataFrame([row])[["failure_reason", "payment_method", "amount",
+                               "customer_previous_payments", "customer_success_rate"]]
+    attempt_no = min(int(row["retry_count"]) + 1, sim.MAX_ATTEMPTS)
+    delay = float(row.get("recommended_delay_h") or 0)
+    frame = sim.attempt_frame(pay, kind, delay, attempt_no, np.array([sim.now_ist()]))
+    return float(sim.true_success_prob(frame)[0])
 
 
 # =========================================================
@@ -518,11 +515,9 @@ def simulate_payment(
 
     # Run ML prediction.
 
-    prob, action, signals = (
-        ml_engine.predict(
-            record
-        )
-    )
+    rec = ml_engine.recommend(record)
+
+    prob, action, signals = rec["prob"], rec["action"], rec["signals"]
 
     conn = get_conn()
 
@@ -556,12 +551,14 @@ def simulate_payment(
 
             recovered_value,
 
-            recommended_action
+            recommended_action,
+
+            recommended_delay_h
 
         )
         VALUES(
             ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?
         )
         """,
         (
@@ -593,6 +590,8 @@ def simulate_payment(
             0,
 
             action,
+
+            rec["delay_h"],
         ),
     )
 
@@ -790,34 +789,23 @@ def payment_action(
     # CALCULATE SUCCESS PROBABILITY
     # -----------------------------------------------------
 
-    chance = outcome_probability(
-
+    chance = world_success_probability(
+        row,
         action,
-
-        prob,
     )
 
     # -----------------------------------------------------
-    # DEMO EXECUTION LOGIC
+    # EXECUTE THE ATTEMPT
     # -----------------------------------------------------
     #
-    # When the merchant explicitly clicks
-    # "Execute action", this demo records the
-    # transaction as successfully recovered.
-    #
-    # This makes the revenue recovery flow
-    # deterministic for the presentation/demo.
-    #
-    # The model probability and calculated
-    # success probability remain visible for
-    # analytics and explainability.
+    # The outcome is sampled from the success probability
+    # (model score adjusted for the action), so an attempt
+    # can fail. Every attempt uses up one retry.
     # -----------------------------------------------------
 
-    success = True
+    success = OUTCOME_RNG.random() < chance
 
     conn = get_conn()
-
-    # Increment retry/action counter.
 
     conn.execute(
 
@@ -866,6 +854,63 @@ def payment_action(
     conn.commit()
 
     conn.close()
+
+    # -----------------------------------------------------
+    # FAILED ATTEMPT
+    # -----------------------------------------------------
+
+    if not success:
+
+        failed_payment = payment_record(
+            payment_id
+        )
+
+        insert_event(
+
+            "retry_failed",
+
+            payment_id,
+
+            "Recovery attempt failed",
+
+            (
+                f"{payment_id} · "
+                f"{action} · "
+                f"attempt {failed_payment['retry_count']} did not recover the payment"
+            ),
+
+            row["amount"],
+
+            {
+
+                "model_probability": prob,
+
+                "success_probability": chance,
+
+                "policy_decision":
+                    policy["decision"],
+
+                "executed": True,
+
+                "retry_count":
+                    failed_payment["retry_count"],
+            },
+        )
+
+        return {
+
+            "ok": True,
+
+            "result": "retry_failed",
+
+            "payment": normalize_payment(
+                failed_payment
+            ),
+
+            "policy": policy,
+
+            "success_probability": chance,
+        }
 
     # -----------------------------------------------------
     # LOG RECOVERY ACTION
@@ -966,22 +1011,25 @@ def payment_action(
 
 @app.post("/api/agent/cycle")
 def agent_cycle():
+    """One autonomous pass over the open failures.
+
+    Every open failed payment is evaluated by policy.decide() in order of expected
+    recoverable value. High-value payments are routed to merchant approval, payments
+    below the confidence threshold or at the retry limit are skipped, and the agent
+    acts on up to AGENT_BATCH_SIZE eligible payments.
+    """
 
     conn = get_conn()
 
     rows = conn.execute(
-    """
-    SELECT *
-    FROM payments
-    WHERE
-        status='failed'
-        AND recovery_probability >= 0.80
-        AND amount < 100000
-        AND retry_count < 3
-    ORDER BY recoverable_value DESC
-    LIMIT 20
-    """
+        """
+        SELECT *
+        FROM payments
+        WHERE status='failed'
+        ORDER BY recoverable_value DESC
+        """
     ).fetchall()
+
     conn.close()
 
     summary = {
@@ -1001,106 +1049,91 @@ def agent_cycle():
         "attempts": 0,
 
         "recovered_value": 0,
+
+        "awaiting_approval_value": 0,
     }
 
     for row in rows:
 
+        if summary["attempts"] >= AGENT_BATCH_SIZE:
+            break
+
         summary["scanned"] += 1
 
         policy = decide(
-
             dict(row),
-
-            float(
-                row[
-                    "recovery_probability"
-                ]
-            ),
-
+            float(row["recovery_probability"]),
             DEFAULT_POLICY,
         )
 
-        # High-value transactions require approval.
+        # High-value payments wait for merchant approval.
 
-        if (
-            policy["decision"]
-            == "manual_review"
-        ):
+        if policy["decision"] == "manual_review":
 
-            summary[
-                "escalated"
-            ] += 1
+            summary["escalated"] += 1
 
-            insert_event(
-
-                "escalation",
-
-                row["payment_id"],
-
-                "Escalated to merchant",
-
-                (
-                    f"{row['payment_id']} · "
-                    "high-value approval required"
-                ),
-
-                row["amount"],
-            )
+            summary["awaiting_approval_value"] += row["amount"]
 
             continue
 
-        # Policy rejected action.
+        # The model found no action worth taking (expected value not positive).
+
+        if row["recommended_action"] == "No action":
+
+            summary["no_action"] += 1
+
+            continue
+
+        # Below the confidence threshold or out of retries.
 
         if not policy["allowed"]:
 
-            summary[
-                "no_action"
-            ] += 1
+            summary["no_action"] += 1
 
             continue
 
-        summary[
-            "eligible"
-        ] += 1
+        summary["eligible"] += 1
 
-        summary[
-            "attempts"
-        ] += 1
+        summary["attempts"] += 1
 
         result = payment_action(
-
             row["payment_id"],
-
-            ActionRequest(
-
-                action=row[
-                    "recommended_action"
-                ]
-            ),
+            ActionRequest(action=row["recommended_action"]),
         )
 
-        if (
-            result["result"]
-            == "recovered"
-        ):
+        if result["result"] == "recovered":
 
-            summary[
-                "recovered"
-            ] += 1
+            summary["recovered"] += 1
 
-            summary[
-                "recovered_value"
-            ] += row["amount"]
+            summary["recovered_value"] += row["amount"]
 
         else:
 
-            summary[
-                "failed"
-            ] += 1
+            summary["failed"] += 1
 
     # -----------------------------------------------------
-    # CYCLE EVENT
+    # CYCLE EVENTS
     # -----------------------------------------------------
+
+    if summary["escalated"]:
+
+        insert_event(
+
+            "escalation",
+
+            None,
+
+            "Awaiting merchant approval",
+
+            (
+                f"{summary['escalated']} high-value payments "
+                "need approval before any automatic action"
+            ),
+
+            summary["awaiting_approval_value"],
+
+            {"count": summary["escalated"]},
+        )
 
     insert_event(
 
@@ -1111,15 +1144,12 @@ def agent_cycle():
         "Recovery cycle completed",
 
         (
-            f"Processed "
-            f"{summary['scanned']} "
-            "high-confidence opportunities · "
-            f"{summary['recovered']} recovered"
+            f"Acted on {summary['attempts']} payments · "
+            f"{summary['recovered']} recovered, "
+            f"{summary['failed']} failed"
         ),
 
-        summary[
-            "recovered_value"
-        ],
+        summary["recovered_value"],
 
         summary,
     )
@@ -1137,6 +1167,8 @@ def reset_demo():
     from .db import clear_demo_data
 
     clear_demo_data()
+
+    ml_engine.rescore_payments()
 
     return {
         "ok": True
