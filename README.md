@@ -122,5 +122,5 @@ python -m backend.backtest     # regenerates reports/ (about 30 seconds)
 
 - **Simulated data and outcomes.** The world's rules are my assumptions (for example that expired cards never recover on retry and that salary timing matters). The model recovers them, so part of its advantage is structural. Real data could behave differently.
 - **Assumed costs.** A retry costs ₹3 and a customer request ₹20 in the expected-value calculation; these are placeholders.
-- **Dashboard numbers.** "Revenue at risk" is a fixed 16% of payment volume (a demo assumption), the agent page's activity feed is static sample text, and the event "Inspect" traces use fixed values. These are not computed from the model.
+- **Dashboard numbers.** Revenue at risk, recoverable value, recovered value and recovery rate are computed from the payments table (recoverable is the model's expected value, not a promise). The only editable policy setting is the automatic-recovery switch; the dashboard's simulator page and its charts (trend and failure-mix on the overview) still show illustrative sample data, and everything is simulated.
 - No authentication, and CORS is open; this is a local prototype.

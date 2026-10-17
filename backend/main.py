@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import random
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ import pandas as pd
 
 from . import ml_engine
 from . import simulation as sim
-from .policy import decide, DEFAULT_POLICY
+from .policy import decide, DEFAULT_POLICY, ACTIVE_POLICY, update_policy
 
 
 # =========================================================
@@ -114,6 +115,8 @@ def normalize_payment(row) -> dict:
             else "Action needed"
         ),
         "retries": d["retry_count"],
+
+        "delayHours": d.get("recommended_delay_h") or 0,
         "risk": round(
             d["recoverable_value"]
         ),
@@ -253,6 +256,12 @@ def events(
                 .astimezone()
                 .strftime("%H:%M:%S"),
 
+                "id": row["id"],
+
+                "payment_id": row["payment_id"],
+
+                "metadata": json.loads(row["metadata_json"] or "{}"),
+
                 "type": row["event_type"],
 
                 "title": row["title"],
@@ -274,119 +283,83 @@ def events(
 
 @app.get("/api/metrics")
 def metrics():
+    """Dashboard numbers computed from the payments table (no assumed percentages).
+
+    atRisk: value of payments still failed. recoverable: expected value (probability x amount)
+    of those open payments. recovered: value recovered so far. rate: recovered value as a share
+    of all failed value (recovered + still open)."""
+
+    limit = DEFAULT_POLICY["high_value_threshold"]
 
     conn = get_conn()
 
     row = conn.execute(
         """
         SELECT
-
-            COALESCE(
-                SUM(amount),
-                0
-            ) AS gross,
-
-            COALESCE(
-                SUM(recoverable_value),
-                0
-            ) AS recoverable,
-
-            COALESCE(
-                SUM(recovered_value),
-                0
-            ) AS recovered,
-
-            SUM(
-                CASE
-                    WHEN status='failed'
-                    THEN 1
-                    ELSE 0
-                END
-            ) AS failed,
-
-            SUM(
-                CASE
-                    WHEN status='recovered'
-                    THEN 1
-                    ELSE 0
-                END
-            ) AS successful,
-
-            SUM(
-                CASE
-                    WHEN recovery_probability >= 0.80
-                    AND status='failed'
-                    THEN 1
-                    ELSE 0
-                END
-            ) AS high_conf
-
+            COALESCE(SUM(CASE WHEN status='failed' THEN amount END), 0) AS open_value,
+            COALESCE(SUM(CASE WHEN status='failed' THEN recoverable_value END), 0) AS expected,
+            COALESCE(SUM(recovered_value), 0) AS recovered,
+            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+            SUM(CASE WHEN status='recovered' THEN 1 ELSE 0 END) AS successful,
+            SUM(CASE WHEN status='failed' AND recovery_probability >= 0.80 THEN 1 ELSE 0 END) AS high_conf,
+            SUM(CASE WHEN status='failed'
+                      AND recommended_action NOT IN ('No action', 'Escalate') THEN 1 ELSE 0 END) AS actionable,
+            SUM(CASE WHEN status='failed' AND amount >= ? THEN 1 ELSE 0 END) AS awaiting_n,
+            COALESCE(SUM(CASE WHEN status='failed' AND amount >= ? THEN amount END), 0) AS awaiting_value
         FROM payments
-        """
+        """,
+        (limit, limit),
     ).fetchone()
 
     conn.close()
 
-    gross = float(
-        row["gross"] or 0
-    )
-
-    recoverable_total = float(
-        row["recoverable"] or 0
-    )
-
-    recovered = float(
-        row["recovered"] or 0
-    )
-
-    # Demo assumption:
-    # 16% of total payment volume is considered
-    # revenue at risk.
-
-    at_risk = gross * 0.16
-
-    recoverable = (
-        recoverable_total * 0.16
-    )
-
-    recovery_rate = (
-        round(
-            recovered
-            / at_risk
-            * 100
-        )
-        if at_risk
-        else 0
-    )
+    open_value = float(row["open_value"] or 0)
+    recovered = float(row["recovered"] or 0)
+    total = open_value + recovered
 
     return {
-
-        "atRisk": round(
-            at_risk
-        ),
-
-        "recoverable": round(
-            recoverable
-        ),
-
-        "recovered": round(
-            recovered
-        ),
-
-        "openFailures": int(
-            row["failed"] or 0
-        ),
-
-        "successfulRecoveries": int(
-            row["successful"] or 0
-        ),
-
-        "highConfidence": int(
-            row["high_conf"] or 0
-        ),
-
-        "rate": recovery_rate,
+        "atRisk": round(open_value),
+        "recoverable": round(float(row["expected"] or 0)),
+        "recovered": round(recovered),
+        "openFailures": int(row["failed"] or 0),
+        "successfulRecoveries": int(row["successful"] or 0),
+        "highConfidence": int(row["high_conf"] or 0),
+        "actionable": int(row["actionable"] or 0),
+        "awaitingApproval": int(row["awaiting_n"] or 0),
+        "awaitingApprovalValue": round(float(row["awaiting_value"] or 0)),
+        "rate": round(100 * recovered / total, 1) if total else 0,
     }
+
+
+# =========================================================
+# POLICY
+# =========================================================
+
+class PolicyUpdate(BaseModel):
+    auto_recovery: bool | None = None
+
+
+@app.get("/api/policy")
+def get_policy():
+    return {**ACTIVE_POLICY, "agent_batch_size": AGENT_BATCH_SIZE}
+
+
+@app.post("/api/policy")
+def set_policy(payload: PolicyUpdate):
+    changes = payload.model_dump(exclude_none=True)
+    try:
+        policy = update_policy(changes)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    insert_event(
+        "analysis",
+        None,
+        "Policy changed",
+        "Automatic recovery " + ("enabled" if policy["auto_recovery"] else "disabled"),
+        0,
+        {"policy": policy},
+    )
+    return {**policy, "agent_batch_size": AGENT_BATCH_SIZE}
 
 
 # =========================================================
@@ -681,7 +654,7 @@ def payment_action(
     policy = decide(
         row,
         prob,
-        DEFAULT_POLICY,
+        ACTIVE_POLICY,
     )
 
     # -----------------------------------------------------
@@ -1019,6 +992,22 @@ def agent_cycle():
     acts on up to AGENT_BATCH_SIZE eligible payments.
     """
 
+    if not ACTIVE_POLICY["auto_recovery"]:
+
+        insert_event(
+            "no_action",
+            None,
+            "Agent paused",
+            "Automatic recovery is disabled, so no actions were taken",
+            0,
+        )
+
+        return {
+            "paused": True, "scanned": 0, "eligible": 0, "recovered": 0, "failed": 0,
+            "escalated": 0, "no_action": 0, "attempts": 0, "recovered_value": 0,
+            "awaiting_approval_value": 0,
+        }
+
     conn = get_conn()
 
     rows = conn.execute(
@@ -1063,7 +1052,7 @@ def agent_cycle():
         policy = decide(
             dict(row),
             float(row["recovery_probability"]),
-            DEFAULT_POLICY,
+            ACTIVE_POLICY,
         )
 
         # High-value payments wait for merchant approval.

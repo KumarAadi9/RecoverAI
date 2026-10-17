@@ -18,19 +18,20 @@ const state = {
     openFailures: 0,
     successfulRecoveries: 0,
     highConfidence: 0,
+    actionable: 0,
+    awaitingApproval: 0,
+    awaitingApprovalValue: 0,
     rate: 0
   },
+
+  // Active policy from the backend
+  policy: { auto_recovery: true, high_value_approval: true, high_value_threshold: 100000,
+            recovery_threshold: 0, max_retries: 3, agent_batch_size: 20 },
 
   // ML model information
   modelInfo: null,
 
   // Merchant controls
-  settings: {
-    autoRecovery: true,
-    notifications: true,
-    approval: true,
-    learning: true
-  },
 
   // Simulator state
   sim: {
@@ -126,7 +127,8 @@ async function syncFromBackend() {
       paymentData,
       eventData,
       metrics,
-      modelInfo
+      modelInfo,
+      policy
     ] = await Promise.all([
 
       api('/payments?limit=5000'),
@@ -135,9 +137,13 @@ async function syncFromBackend() {
 
       api('/metrics'),
 
-      api('/model/info')
+      api('/model/info'),
+
+      api('/policy')
 
     ]);
+
+    state.policy = policy || state.policy;
 
 
     // Payments
@@ -345,6 +351,8 @@ function kpis(){
     atRisk: state.metrics.atRisk || 0,
     recoverable: state.metrics.recoverable || 0,
     recovered: state.metrics.recovered || 0,
+    openFailures: state.metrics.openFailures || 0,
+    successfulRecoveries: state.metrics.successfulRecoveries || 0,
     rate: state.metrics.rate || 0
   };
 }
@@ -361,9 +369,7 @@ function dashboardPage(){
     p => p.status !== 'Recovered' && p.prob >= 80
   ).length;
 
-  const highValue = state.payments.filter(
-    p => p.status !== 'Recovered' && p.amount >= 50000
-  ).length;
+  const highValue = state.metrics.awaitingApproval || 0;
 
   return `
     <div class="hero">
@@ -404,21 +410,21 @@ function dashboardPage(){
         <div class="pulse-head">
           <div>
             <div class="section-title">Recovery pulse</div>
-            <div class="section-sub">Live opportunity detection</div>
+            <div class="section-sub">Model estimate on simulated payments</div>
           </div>
 
-          <span class="pill green">● LIVE</span>
+          <span class="pill green">SIMULATED</span>
         </div>
 
         <div class="pulse-number">${money(k.recoverable)}</div>
         <div class="pulse-label">estimated recoverable revenue</div>
 
         <div class="pulse-bar">
-          <span style="width:${Math.min(94,k.rate + 22)}%"></span>
+          <span style="width:${Math.min(100, k.rate)}%"></span>
         </div>
 
         <div class="pulse-foot">
-          <span>AI opportunity identified</span>
+          <span>Share of failed value recovered</span>
           <strong>${highConfidence} high-confidence cases</strong>
         </div>
       </div>
@@ -437,23 +443,23 @@ function dashboardPage(){
       ${metric(
         'Revenue at risk',
         money(k.atRisk),
-        '↑ 8.7%',
-        'negative',
+        `${k.openFailures.toLocaleString('en-IN')} open failures`,
+        'neutral',
         '◒'
       )}
 
       ${metric(
         'Recoverable revenue',
         money(k.recoverable),
-        '↑ 12.4%',
-        'positive',
+        'expected value of open failures',
+        'neutral',
         '↗'
       )}
 
       ${metric(
         'Revenue recovered',
         money(k.recovered),
-        '↑ 18.1%',
+        `${k.successfulRecoveries.toLocaleString('en-IN')} payments recovered`,
         'positive',
         '✓'
       )}
@@ -461,8 +467,8 @@ function dashboardPage(){
       ${metric(
         'Recovery rate',
         k.rate + '%',
-        '↑ 6.8 pts',
-        'positive',
+        'recovered ÷ (recovered + still open)',
+        'neutral',
         '✦'
       )}
     </div>
@@ -502,7 +508,7 @@ function dashboardPage(){
         <span class="pipeline-icon">03</span>
         <div>
           <strong>Decide</strong>
-          <p>${highValue} high-value cases routed through policy checks</p>
+          <p>${highValue} high-value cases waiting for merchant approval</p>
         </div>
       </div>
 
@@ -512,7 +518,7 @@ function dashboardPage(){
         <span class="pipeline-icon">04</span>
         <div>
           <strong>Recover</strong>
-          <p>AI executes the safest next-best action</p>
+          <p>${state.metrics.actionable || 0} open cases have an action queued</p>
         </div>
       </div>
     </div>
@@ -555,11 +561,11 @@ function dashboardPage(){
           <div>
             <div class="chart-title">Revenue recovery trend</div>
             <div class="chart-sub">
-              Estimated opportunity vs. recovered revenue
+              Illustrative placeholder, not computed from payments
             </div>
           </div>
 
-          <span class="pill green">AI impact</span>
+          <span class="pill">Sample data</span>
         </div>
 
         <div class="chart-wrap">
@@ -584,7 +590,7 @@ function dashboardPage(){
           <div>
             <div class="chart-title">Failure mix</div>
             <div class="chart-sub">
-              Where recovery opportunities originate
+              Illustrative placeholder, not computed from payments
             </div>
           </div>
         </div>
@@ -681,7 +687,7 @@ function dashboardPage(){
   `;
 }
 
-function metric(label,value,change,cls,icon){return `<div class="metric-card"><div class="metric-top"><span>${label}</span><span class="metric-icon">${icon}</span></div><div class="metric-value">${value}</div><div class="metric-change ${cls}">${change} vs previous period</div></div>`;}
+function metric(label,value,change,cls,icon){return `<div class="metric-card"><div class="metric-top"><span>${label}</span><span class="metric-icon">${icon}</span></div><div class="metric-value">${value}</div><div class="metric-change ${cls}">${change}</div></div>`;}
 
 function lineChart(){
   const w=640,h=210,p=22; const a=[62,70,65,82,74,89,92,86,104,98,112,118], b=[31,36,34,42,46,51,57,55,69,70,78,85];
@@ -693,7 +699,7 @@ function donutChart(){
   const vals=[28,23,18,14,10,7], total=100; let start=-90, paths=''; const cx=160,cy=100,r=64,ri=43; const cols=['#2d7ff9','#53c9a5','#f59d4b','#8f6ff0','#8da1b9','#d2dce8'];
   function arc(a1,a2){const toRad=a=>a*Math.PI/180; const x1=cx+r*Math.cos(toRad(a1)),y1=cy+r*Math.sin(toRad(a1)); const x2=cx+r*Math.cos(toRad(a2)),y2=cy+r*Math.sin(toRad(a2)); const xi1=cx+ri*Math.cos(toRad(a2)),yi1=cy+ri*Math.sin(toRad(a2)); const xi2=cx+ri*Math.cos(toRad(a1)),yi2=cy+ri*Math.sin(toRad(a1)); const large=a2-a1>180?1:0; return `M ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} L ${xi1} ${yi1} A ${ri} ${ri} 0 ${large} 0 ${xi2} ${yi2} Z`;}
   vals.forEach((v,i)=>{const end=start+v/total*360;paths+=`<path d="${arc(start,end)}" fill="${cols[i]}"/>`;start=end;});
-  return `<svg class="chart-svg" viewBox="0 0 320 200"><g transform="translate(0 0)">${paths}</g><text x="160" y="95" text-anchor="middle" font-size="21" font-weight="800" fill="#0d1730">1,284</text><text x="160" y="112" text-anchor="middle" font-size="9" fill="#7a8798">failed payments</text></svg>`;
+  return `<svg class="chart-svg" viewBox="0 0 320 200"><g transform="translate(0 0)">${paths}</g><text x="160" y="95" text-anchor="middle" font-size="21" font-weight="800" fill="#0d1730">—</text><text x="160" y="112" text-anchor="middle" font-size="9" fill="#7a8798">sample</text></svg>`;
 }
 
 function paymentsPage(){
@@ -712,21 +718,13 @@ function paymentTable(rows,compact){
 function formatDate(ts){const d=new Date(ts); return d.toLocaleDateString('en-IN',{day:'2-digit',month:'short'});}
 
 function agentPage(){
-
-  const metrics = state.metrics || {};
-
-  const pending =
-    metrics.openFailures || 0;
-
-  const high =
-    metrics.highConfidence || 0;
-
-  const recovered =
-    metrics.recovered || 0;
-
-  return `<div class="agent-layout"><div class="card agent-big"><div class="agent-head"><div><div class="section-title">Recovery agent</div><div class="section-sub">Autonomous decisions under merchant policy</div></div><span class="pill green">● LIVE</span></div><div class="agent-orb">✦</div><div class="agent-state"><strong>RecoverAI agent is operating</strong><p>Scanning ${pending.toLocaleString('en-IN')} open failures · ${high} high-confidence actions queued</p></div><div class="agent-kpis">${mini('Open failures',pending.toLocaleString('en-IN'))}${mini('High-confidence',high.toLocaleString('en-IN'))}${mini('Recovered value',money(recovered))}</div><div class="agent-actions"><button class="btn-ghost" id="agent-pause">Pause agent</button><button class="btn-green" id="agent-run">Run recovery cycle</button></div></div><div class="card feed"><div class="section-title">Agent activity</div><div class="section-sub">Most recent decisions and executions</div><div style="margin-top:18px">${feedItem('10:42 AM','High-value opportunity identified','RP20518 · ₹84,000 · 88% recovery probability · gateway timeout.')}${feedItem('10:41 AM','Retry scheduled','RP20492 · Retry window selected for 10:00–11:00 AM based on merchant history.')}${feedItem('10:39 AM','Payment method recovery','RP20601 · Card expired → customer update link prepared.')}${feedItem('10:35 AM','Escalated to merchant','RP20577 · ₹4.5L · above approval threshold, manual review required.')}</div></div></div>
-    <div class="section-row"><div><div class="section-title">What the agent considers</div><div class="section-sub">The model combines structured signals before taking action.</div></div></div>
-    <div class="metric-grid">${signalCard('Failure reason','Classifies temporary vs. user-actionable failures','Bank decline, timeout, expired card')}${signalCard('Customer history','Weights repeat success and prior recoveries','31 successful payments, 94% success rate')}${signalCard('Transaction value','Escalates unusual or high-value transactions','₹4.5L → manual approval')}${signalCard('Timing','Selects the highest-likelihood recovery window','Tomorrow, 10–11 AM')}</div>`;
+  const m = state.metrics || {};
+  const on = state.policy.auto_recovery;
+  const feed = (state.events || []).slice(0, 6).map(e =>
+    feedItem(e.time, e.title, e.detail)).join('') || '<div class="empty">No agent activity yet.</div>';
+  return `<div class="agent-layout"><div class="card agent-big"><div class="agent-head"><div><div class="section-title">Recovery agent</div><div class="section-sub">Decisions follow the policy; outcomes are simulated</div></div><span class="pill ${on?'green':''}">${on?'ENABLED':'PAUSED'}</span></div><div class="agent-orb">✦</div><div class="agent-state"><strong>${on?'Agent runs when you start a cycle':'Agent is paused'}</strong><p>${(m.openFailures||0).toLocaleString('en-IN')} open failures · ${(m.actionable||0).toLocaleString('en-IN')} with an action queued · each cycle acts on up to ${state.policy.agent_batch_size} by expected value</p></div><div class="agent-kpis">${mini('Open failures',(m.openFailures||0).toLocaleString('en-IN'))}${mini('Awaiting approval',(m.awaitingApproval||0).toLocaleString('en-IN'))}${mini('Recovered value',money(m.recovered||0))}</div><div class="agent-actions"><button class="btn-ghost" id="agent-pause">${on?'Pause agent':'Resume agent'}</button><button class="btn-green" id="agent-run" ${on?'':'disabled'}>Run recovery cycle</button></div></div><div class="card feed"><div class="section-title">Agent activity</div><div class="section-sub">Latest logged decisions and outcomes</div><div style="margin-top:18px">${feed}</div></div></div>
+    <div class="section-row"><div><div class="section-title">What the agent considers</div><div class="section-sub">Inputs to the model and the rules around it.</div></div></div>
+    <div class="metric-grid">${signalCard('Failure reason','Temporary vs. customer-fixable failures','Timeouts, bank declines, expired cards')}${signalCard('Customer history','Past payment count and success rate','Used as model features')}${signalCard('Action and timing','Expected value of each retry delay or customer request','Highest expected value wins')}${signalCard('Policy','High-value payments need approval','Above ₹'+state.policy.high_value_threshold.toLocaleString('en-IN'))}</div>`;
 }
 function mini(l,v){return `<div class="mini-kpi"><label>${l}</label><strong>${v}</strong></div>`}
 function feedItem(time,title,copy){return `<div class="feed-item"><span class="feed-dot"></span><div class="feed-time">${time}</div><div class="feed-title">${title}</div><div class="feed-copy">${copy}</div></div>`}
@@ -739,7 +737,9 @@ function simulatorPage(){
 function slider(label,key,val,min,max,step,fmt){return `<div class="form-row"><div class="form-label"><span>${label}</span><strong id="${key}-value">${fmt(val)}</strong></div><input class="slider" type="range" min="${min}" max="${max}" step="${step}" value="${val}" data-sim="${key}"/></div>`}
 
 function settingsPage(){
-  return `<div class="settings-grid"><div class="card setting-card"><div class="section-title">Automation policy</div><div class="section-sub">Define what RecoverAI can do without manual approval.</div>${setting('autoRecovery','Automatic recovery','Allow the agent to execute approved retry and payment-method recovery actions.',state.settings.autoRecovery)}${setting('approval','Manual approval for high-value payments','Escalate transactions above ₹1,00,000 instead of acting automatically.',state.settings.approval)}${setting('notifications','Customer notifications','Allow the agent to prepare customer-facing recovery notifications.',state.settings.notifications)}</div><div class="card setting-card"><div class="section-title">Learning & analytics</div><div class="section-sub">Control how outcome data improves future decisions.</div>${setting('learning','Outcome-based learning','Use recovery outcomes to recalibrate the scoring model over time.',state.settings.learning)}<div class="setting-row"><div class="setting-copy"><strong>Recovery threshold</strong><p>Only recommend automation when predicted probability is at least 60%.</p></div><div style="font-size:10px;font-weight:800">60%</div></div><div class="setting-row"><div class="setting-copy"><strong>High-value threshold</strong><p>Transactions above this amount are routed to the merchant for review.</p></div><div style="font-size:10px;font-weight:800">₹1,00,000</div></div><div class="setting-row"><div class="setting-copy"><strong>Max automatic retries</strong><p>Prevent repeated customer attempts from becoming noisy or costly.</p></div><div style="font-size:10px;font-weight:800">3</div></div></div></div><div class="card setting-card" style="margin-top:14px"><div class="section-title">AI guardrails</div><div class="section-sub">The agent is designed to optimize recovery without hiding important decisions.</div><div class="signal-grid" style="margin-top:14px">${signalCard('Safety','Escalate unusual value','High-value payments require approval.')}${signalCard('Explainability','Show every decision','Every action includes the signals behind it.')}${signalCard('Restraint','Stop low-confidence actions','The agent can recommend “do nothing”.')}${signalCard('Audit','Keep recovery history','All decisions and outcomes stay traceable.')}</div></div>`;
+  const pl = state.policy;
+  const row = (t,d,v)=>`<div class="setting-row"><div class="setting-copy"><strong>${t}</strong><p>${d}</p></div><div style="font-size:10px;font-weight:800">${v}</div></div>`;
+  return `<div class="settings-grid"><div class="card setting-card"><div class="section-title">Automation policy</div><div class="section-sub">Only the automatic-recovery switch is editable; the guardrails below are fixed in code.</div>${setting('autoRecovery','Automatic recovery','When off, recovery cycles take no actions.',pl.auto_recovery)}${row('Manual approval for high-value payments','Payments at or above the threshold are escalated, never retried automatically. Always on.','Always on')}</div><div class="card setting-card"><div class="section-title">Guardrails (read-only)</div><div class="section-sub">Current values from the backend policy.</div>${row('Confidence floor',pl.recovery_threshold>0?'Minimum predicted success probability to act.':'No per-attempt floor; the agent acts when expected value is positive (a floor reduced recovered value in backtests).',pl.recovery_threshold>0?Math.round(pl.recovery_threshold*100)+'%':'None (EV gate)')}${row('High-value threshold','Escalate at or above this amount.','₹'+pl.high_value_threshold.toLocaleString('en-IN'))}${row('Max automatic attempts','Stops repeated attempts on one payment.',pl.max_retries)}${row('Actions per cycle','Cases handled per cycle, highest expected value first.',pl.agent_batch_size)}</div></div><div class="card setting-card" style="margin-top:14px"><div class="section-title">AI guardrails</div><div class="section-sub">What the agent does and does not do.</div><div class="signal-grid" style="margin-top:14px">${signalCard('Safety','Escalate high value','Above the threshold, a human decides.')}${signalCard('Explainability','Show the signals','Each payment lists the model inputs and alternatives.')}${signalCard('Restraint','Can take no action','Negative expected value means no action.')}${signalCard('Audit','Event log','Decisions and outcomes are stored as events.')}</div></div>`;
 }
 function setting(key,title,desc,on){return `<div class="setting-row"><div class="setting-copy"><strong>${title}</strong><p>${desc}</p></div><button class="toggle ${on?'on':''}" data-toggle="${key}"><span></span></button></div>`}
 
@@ -748,10 +748,10 @@ function bindPageEvents(){
   document.querySelectorAll('[data-payment]').forEach(el=>el.onclick=()=>openPayment(el.dataset.payment));
   const search=document.querySelector('#payment-search'); if(search) search.oninput=e=>{state.search=e.target.value;render()};
   const filter=document.querySelector('#payment-filter'); if(filter){filter.value=state.filter;filter.onchange=e=>{state.filter=e.target.value;render()}}
-  document.querySelectorAll('[data-toggle]').forEach(btn=>btn.onclick=()=>{const k=btn.dataset.toggle;state.settings[k]=!state.settings[k];render();toast(`${labelFor(k)} ${state.settings[k]?'enabled':'disabled'}.`)});
+  document.querySelectorAll('[data-toggle]').forEach(btn=>btn.onclick=()=>setAutoRecovery(!state.policy.auto_recovery));
   document.querySelectorAll('[data-sim]').forEach(input=>input.oninput=e=>{state.sim[e.target.dataset.sim]=Number(e.target.value);render()});
   const run=document.querySelector('#agent-run'); if(run) run.onclick=runAgentCycle;
-  const pause=document.querySelector('#agent-pause'); if(pause) pause.onclick=()=>toast('Agent paused for this session. No automated actions will execute.');
+  const pause=document.querySelector('#agent-pause'); if(pause) pause.onclick=()=>setAutoRecovery(!state.policy.auto_recovery);
   const simulateEvent =
   document.querySelector('#simulate-event-btn');
 
@@ -759,6 +759,13 @@ if(simulateEvent){
 
   simulateEvent.onclick = simulatePayment;
 }
+}
+async function setAutoRecovery(on){
+  try{
+    state.policy = await api('/policy',{method:'POST',body:JSON.stringify({auto_recovery:on})});
+    await syncFromBackend();
+    toast(`Automatic recovery ${on?'enabled':'disabled'}.`);
+  }catch(e){toast(`Could not change policy: ${e.message}`);}
 }
 function labelFor(k){return ({autoRecovery:'Automatic recovery',approval:'High-value approval',notifications:'Customer notifications',learning:'Outcome learning'})[k]}
 async function simulatePayment(){
@@ -825,6 +832,8 @@ async function runAgentCycle(){
 
     await syncFromBackend();
 
+    if(result.paused){ toast('Agent is paused. No actions were taken.'); return; }
+
     toast(
       `Cycle complete — ${result.recovered} recovered, ${result.failed} failed, ${result.escalated} escalated.`
     );
@@ -847,7 +856,7 @@ async function runAgentCycle(){
 }
 function openPayment(id){
   const p=state.payments.find(x=>x.id===id); if(!p) return; state.selectedPayment=p;
-  document.querySelector('#modal-root').innerHTML=`<div class="modal-backdrop"><div class="modal"><div class="modal-head"><div><div class="eyebrow" style="color:#3b7bd6">AI PAYMENT ANALYSIS</div><h3>${p.id} · ${money(p.amount)}</h3><p>${p.customer} · ${p.method} · ${p.reason}</p></div><button class="modal-close" id="close-modal">✕</button></div><div class="modal-body"><div class="score-panel"><div class="score-ring"><span>${p.prob}%</span></div><div><div class="section-title">Recovery probability</div><div class="section-sub">Based on failure class, customer history, retry behavior and transaction value.</div><div class="signal-grid" style="margin-top:11px">${signal('Failure class',p.reason)}${signal('Customer success',Math.round(p.successRate*100)+'%')}${signal('Prior payments',p.previous)}${signal('Suggested timing',p.reason.includes('timeout')?'Now':'2 hours')}</div></div></div><div class="ai-box"><h4>✦ AI reasoning</h4><p>${reasoning(p)}</p></div><div class="ai-action"><div><strong>Recommended action: ${p.recommended}</strong><span>Expected recovered value: ${money(p.risk)} · Confidence: ${p.prob>=80?'High':p.prob>=60?'Medium':'Low'}</span></div><button class="primary-btn" id="modal-act">Execute action</button></div></div><div class="modal-footer"><button class="outline-btn" id="modal-dismiss">Close</button><button class="primary-btn" id="modal-escalate">Escalate to merchant</button></div></div></div>`;
+  document.querySelector('#modal-root').innerHTML=`<div class="modal-backdrop"><div class="modal"><div class="modal-head"><div><div class="eyebrow" style="color:#3b7bd6">AI PAYMENT ANALYSIS</div><h3>${p.id} · ${money(p.amount)}</h3><p>${p.customer} · ${p.method} · ${p.reason}</p></div><button class="modal-close" id="close-modal">✕</button></div><div class="modal-body"><div class="score-panel"><div class="score-ring"><span>${p.prob}%</span></div><div><div class="section-title">Recovery probability</div><div class="section-sub">Based on failure class, customer history, retry behavior and transaction value.</div><div class="signal-grid" style="margin-top:11px">${signal('Failure class',p.reason)}${signal('Customer success',Math.round(p.successRate*100)+'%')}${signal('Prior payments',p.previous)}${signal('Suggested timing',p.delayHours?`in ${p.delayHours}h`:'Now')}</div></div></div><div class="ai-box"><h4>✦ AI reasoning</h4><p>${reasoning(p)}</p></div><div class="ai-action"><div><strong>Recommended action: ${p.recommended}</strong><span>Expected recovered value: ${money(p.risk)} · Confidence: ${p.prob>=80?'High':p.prob>=60?'Medium':'Low'}</span></div><button class="primary-btn" id="modal-act">Execute action</button></div></div><div class="modal-footer"><button class="outline-btn" id="modal-dismiss">Close</button><button class="primary-btn" id="modal-escalate">Escalate to merchant</button></div></div></div>`;
   document.querySelector('#close-modal').onclick=closeModal;document.querySelector('#modal-dismiss').onclick=closeModal;
   document.querySelector('#modal-act').onclick = async () => {
 
@@ -976,11 +985,7 @@ function liveEvents(){
 
         <button
           class="event-view"
-          onclick="openEventTrace(
-            '${event.type}',
-            '${String(event.detail).replaceAll("'", "\\'")}',
-            ${event.amount || 0}
-          )"
+          onclick="openEventTrace(${event.id})"
         >
           Inspect
         </button>
@@ -991,258 +996,17 @@ function liveEvents(){
 }
 
 
-function openEventTrace(type, detail, amount){
-
-  const probability =
-    type === 'success'
-      ? 96
-      : type === 'analysis'
-      ? 91
-      : type === 'recovery'
-      ? 88
-      : type === 'escalation'
-      ? 63
-      : 84;
-
-  const action =
-    type === 'success'
-      ? 'Recovery completed'
-      : type === 'escalation'
-      ? 'Escalate to merchant'
-      : type === 'recovery'
-      ? 'Smart retry'
-      : probability >= 85
-      ? 'Retry after 2 hours'
-      : 'Request customer action';
-
-  document.querySelector('#modal-root').innerHTML = `
-
-    <div class="modal-backdrop">
-
-      <div class="modal decision-modal">
-
-        <div class="modal-head">
-
-          <div>
-
-            <div class="eyebrow" style="color:#3b7bd6">
-              AI DECISION TRACE
-            </div>
-
-            <h3>
-              ${detail}
-            </h3>
-
-            <p>
-              Transaction value · ${money(amount)}
-            </p>
-
-          </div>
-
-          <button
-            class="modal-close"
-            id="close-event-modal"
-          >
-            ✕
-          </button>
-
-        </div>
-
-
-        <div class="modal-body">
-
-          <div class="trace-score">
-
-            <div class="trace-score-ring">
-              <span>${probability}%</span>
-            </div>
-
-            <div>
-
-              <div class="section-title">
-                Recovery probability
-              </div>
-
-              <div class="section-sub">
-                AI confidence score for successful recovery.
-              </div>
-
-            </div>
-
-          </div>
-
-
-          <div class="ai-box">
-
-            <h4>✦ AI reasoning</h4>
-
-            <p>
-              The recovery engine evaluated failure type, customer payment
-              history, transaction value, retry history and merchant policy.
-              The model estimates a
-              <strong>${probability}%</strong>
-              probability of successful recovery.
-            </p>
-
-          </div>
-
-
-          <div class="decision-flow">
-
-            <div class="decision-flow-item">
-              <span>1</span>
-              <strong>Detect</strong>
-              <small>Payment event received</small>
-            </div>
-
-            <div class="decision-flow-item">
-              <span>2</span>
-              <strong>Score</strong>
-              <small>${probability}% probability</small>
-            </div>
-
-            <div class="decision-flow-item">
-              <span>3</span>
-              <strong>Guardrail</strong>
-              <small>
-                ${amount > 100000
-                  ? 'Manual approval required'
-                  : 'Policy passed'}
-              </small>
-            </div>
-
-            <div class="decision-flow-item">
-              <span>4</span>
-              <strong>Action</strong>
-              <small>${action}</small>
-            </div>
-
-          </div>
-
-
-          <div class="ai-action">
-
-            <div>
-
-              <strong>
-                Recommended action: ${action}
-              </strong>
-
-              <span>
-                Expected recoverable value:
-                ${money(amount * probability / 100)}
-              </span>
-
-            </div>
-
-            <button
-              class="primary-btn"
-              id="execute-trace-action"
-            >
-              Execute action
-            </button>
-
-          </div>
-
-        </div>
-
-
-        <div class="modal-footer">
-
-          <button
-            class="outline-btn"
-            id="dismiss-event-modal"
-          >
-            Close
-          </button>
-
-        </div>
-
-      </div>
-
-    </div>
-  `;
-                
-
-  document.querySelector('#close-event-modal').onclick = closeModal;
-  document.querySelector('#dismiss-event-modal').onclick = closeModal;
-
-  document.querySelector('#execute-trace-action').onclick = async () => {
-
-    const button =
-        document.querySelector('#execute-trace-action');
-
-    if (button) {
-        button.disabled = true;
-        button.textContent = 'Executing…';
-    }
-
-    try {
-
-        // Find the payment associated with this event.
-        const payment = state.payments.find(
-            p => Number(p.amount) === Number(amount)
-        );
-
-        if (!payment) {
-            throw new Error(
-                'Could not identify the payment for this event.'
-            );
-        }
-
-        const result = await api(
-            `/payments/${payment.id}/action`,
-            {
-                method: 'POST',
-                body: JSON.stringify({
-                    action: payment.recommended
-                })
-            }
-        );
-
-        closeModal();
-
-        await syncFromBackend();
-
-        if (result.result === 'recovered') {
-
-            toast(
-                `${payment.id} recovered — ${money(payment.amount)} added to recovered revenue.`
-            );
-
-        } else if (result.result === 'escalated') {
-
-            toast(
-                `${payment.id} escalated for merchant approval.`
-            );
-
-        } else if (result.result === 'retry_failed') {
-
-            toast(
-                `${payment.id}: recovery attempt failed (retry ${result.payment.retries}).`
-            );
-
-        } else {
-
-            toast(
-                `${payment.id}: no recovery action executed.`
-            );
-        }
-
-    } catch (error) {
-
-        console.error(error);
-
-        toast(
-            `Recovery action failed: ${error.message}`
-        );
-
-        if (button) {
-            button.disabled = false;
-            button.textContent = 'Execute action';
-        }
-    }
-};
+function openEventTrace(id){
+  const e = state.events.find(x => x.id === id);
+  if(!e) return;
+  const meta = e.metadata || {};
+  const rows = Object.entries(meta).filter(([,v]) => typeof v !== 'object')
+    .map(([k,v]) => `<div class="signal"><label>${k.replaceAll('_',' ')}</label><strong>${v}</strong></div>`).join('');
+  document.querySelector('#modal-root').innerHTML = `<div class="modal-backdrop"><div class="modal decision-modal"><div class="modal-head"><div><div class="eyebrow" style="color:#3b7bd6">EVENT LOG</div><h3>${e.title}</h3><p>${e.time}${e.payment_id?' · '+e.payment_id:''}</p></div><button class="modal-close" id="close-modal">✕</button></div><div class="modal-body"><div class="ai-box"><h4>Detail</h4><p>${e.detail}</p></div>${rows?`<div class="signal-grid" style="margin-top:11px">${rows}</div>`:''}</div><div class="modal-footer"><button class="outline-btn" id="modal-dismiss">Close</button>${e.payment_id?'<button class="primary-btn" id="open-payment">Open payment</button>':''}</div></div></div>`;
+  document.querySelector('#close-modal').onclick = closeModal;
+  document.querySelector('#modal-dismiss').onclick = closeModal;
+  const op = document.querySelector('#open-payment');
+  if(op) op.onclick = () => { closeModal(); openPayment(e.payment_id); };
 }
 
 // Global interactions

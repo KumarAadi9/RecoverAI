@@ -12,6 +12,21 @@ DEFAULT_POLICY = {
     'max_retries': 3,
 }
 
+# The policy the running app uses. Only the automatic-recovery switch can be changed at runtime
+# (a kill switch); the other guardrails stay fixed so they cannot be switched off from the UI.
+ACTIVE_POLICY = dict(DEFAULT_POLICY)
+EDITABLE = ("auto_recovery",)
+
+
+def update_policy(changes: dict) -> dict:
+    for key, value in changes.items():
+        if key not in EDITABLE:
+            raise ValueError(f"{key} cannot be changed at runtime")
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be true or false")
+        ACTIVE_POLICY[key] = value
+    return dict(ACTIVE_POLICY)
+
 
 def decide(payment: dict, probability: float, policy: dict | None = None) -> dict:
     p = {**DEFAULT_POLICY, **(policy or {})}
