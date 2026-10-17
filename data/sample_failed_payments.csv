@@ -1,0 +1,6 @@
+payment_id,customer_id,amount,payment_method,failure_reason,timestamp,customer_previous_payments,customer_success_rate
+IMP0001,CUST9001,2499,UPI,Network timeout,2026-10-12 11:30:00,14,0.93
+IMP0002,CUST9002,18999,Card,Card expired,2026-10-12 15:10:00,6,0.71
+IMP0003,CUST9003,799,Wallet,Insufficient funds,2026-10-13 03:20:00,3,0.55
+IMP0004,CUST9004,5400,Netbanking,Bank declined,2026-10-13 18:45:00,22,0.88
+IMP0005,CUST9005,12500,Card,Authentication failed,2026-10-14 10:05:00,9,0.80
