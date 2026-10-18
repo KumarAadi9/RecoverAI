@@ -31,14 +31,17 @@ const state = {
   // ML model information
   modelInfo: null,
 
+  // Computed analytics and the simulated backtest report
+  analytics: { daily: [], failureMix: [], attempts: { logged: 0, succeeded: 0 } },
+  backtest: null,
+
   // Merchant controls
 
   // Simulator state
   sim: {
     transactions: 100000,
     avgAmount: 1500,
-    failRate: 8,
-    recoverRate: 67
+    failRate: 8
   },
 
   // Loading state
@@ -71,17 +74,31 @@ function initials(value){
 const API = '/api';
 
 
+function storedKey() {
+  try { return localStorage.getItem('recoverai_key') || ''; } catch (e) { return ''; }
+}
+
 async function api(path, options = {}) {
 
   const response = await fetch(`${API}${path}`, {
 
     headers: {
       'Content-Type': 'application/json',
+      ...(storedKey() ? { 'X-API-Key': storedKey() } : {}),
       ...(options.headers || {})
     },
 
     ...options
   });
+
+  // The backend can require an API key for write requests; ask once and retry.
+  if (response.status === 401 && (options.method || 'GET') === 'POST' && !options._retried) {
+    const key = window.prompt('This server requires an API key for actions. Enter it:');
+    if (key) {
+      try { localStorage.setItem('recoverai_key', key); } catch (e) {}
+      return api(path, { ...options, _retried: true });
+    }
+  }
 
 
   if (!response.ok) {
@@ -128,7 +145,9 @@ async function syncFromBackend() {
       eventData,
       metrics,
       modelInfo,
-      policy
+      policy,
+      analytics,
+      backtest
     ] = await Promise.all([
 
       api('/payments?limit=5000'),
@@ -139,9 +158,16 @@ async function syncFromBackend() {
 
       api('/model/info'),
 
-      api('/policy')
+      api('/policy'),
+
+      api('/analytics'),
+
+      api('/backtest').catch(() => null)
 
     ]);
+
+    state.analytics = analytics || state.analytics;
+    state.backtest = backtest;
 
     state.policy = policy || state.policy;
 
@@ -561,11 +587,11 @@ function dashboardPage(){
           <div>
             <div class="chart-title">Revenue recovery trend</div>
             <div class="chart-sub">
-              Illustrative placeholder, not computed from payments
+              Failed value per day vs. value recovered, from the payments table
             </div>
           </div>
 
-          <span class="pill">Sample data</span>
+          <span class="pill green">Computed</span>
         </div>
 
         <div class="chart-wrap">
@@ -590,7 +616,7 @@ function dashboardPage(){
           <div>
             <div class="chart-title">Failure mix</div>
             <div class="chart-sub">
-              Illustrative placeholder, not computed from payments
+              Open and recovered failures by reason
             </div>
           </div>
         </div>
@@ -690,16 +716,25 @@ function dashboardPage(){
 function metric(label,value,change,cls,icon){return `<div class="metric-card"><div class="metric-top"><span>${label}</span><span class="metric-icon">${icon}</span></div><div class="metric-value">${value}</div><div class="metric-change ${cls}">${change}</div></div>`;}
 
 function lineChart(){
-  const w=640,h=210,p=22; const a=[62,70,65,82,74,89,92,86,104,98,112,118], b=[31,36,34,42,46,51,57,55,69,70,78,85];
-  const max=125; const pt=arr=>arr.map((v,i)=>`${p+i*(w-2*p)/(arr.length-1)},${h-p-v*(h-2*p)/max}`).join(' ');
-  let grid='';[0,25,50,75,100].forEach(v=>{const y=h-p-v*(h-2*p)/max; grid+=`<line x1="${p}" y1="${y}" x2="${w-p}" y2="${y}" stroke="#edf1f5" stroke-width="1"/>`;});
-  return `<svg class="chart-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${grid}<polyline points="${pt(a)}" fill="none" stroke="#2d7ff9" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><polyline points="${pt(b)}" fill="none" stroke="#53c9a5" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>${b.map((v,i)=>{const x=p+i*(w-2*p)/(b.length-1),y=h-p-v*(h-2*p)/max;return `<circle cx="${x}" cy="${y}" r="3.2" fill="#53c9a5"/>`;}).join('')}</svg>`;
+  const d = state.analytics.daily || [];
+  if(d.length < 2) return '<div class="empty">Not enough data yet.</div>';
+  const w=640,h=210,p=22;
+  const a=d.map(x=>x.failed_value), b=d.map(x=>x.recovered_value);
+  const max=Math.max(...a,1)*1.08;
+  const pt=arr=>arr.map((v,i)=>`${p+i*(w-2*p)/(arr.length-1)},${h-p-v*(h-2*p)/max}`).join(' ');
+  let grid='';[0,.25,.5,.75,1].forEach(f=>{const y=h-p-f*max/1.08*(h-2*p)/max; grid+=`<line x1="${p}" y1="${y}" x2="${w-p}" y2="${y}" stroke="#edf1f5" stroke-width="1"/>`;});
+  const first=d[0].day.slice(5), last=d[d.length-1].day.slice(5);
+  return `<svg class="chart-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${grid}<polyline points="${pt(a)}" fill="none" stroke="#2d7ff9" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><polyline points="${pt(b)}" fill="none" stroke="#53c9a5" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg><div class="chart-sub" style="display:flex;justify-content:space-between"><span>${first}</span><span><span style="color:#2d7ff9">━</span> failed value &nbsp; <span style="color:#53c9a5">━</span> recovered value</span><span>${last}</span></div>`;
 }
 function donutChart(){
-  const vals=[28,23,18,14,10,7], total=100; let start=-90, paths=''; const cx=160,cy=100,r=64,ri=43; const cols=['#2d7ff9','#53c9a5','#f59d4b','#8f6ff0','#8da1b9','#d2dce8'];
+  const mix = state.analytics.failureMix || [];
+  const total = mix.reduce((t,x)=>t+x.n,0);
+  if(!total) return '<div class="empty">No failures yet.</div>';
+  let start=-90, paths=''; const cx=160,cy=100,r=64,ri=43; const cols=['#2d7ff9','#53c9a5','#f59d4b','#8f6ff0','#8da1b9','#d2dce8'];
   function arc(a1,a2){const toRad=a=>a*Math.PI/180; const x1=cx+r*Math.cos(toRad(a1)),y1=cy+r*Math.sin(toRad(a1)); const x2=cx+r*Math.cos(toRad(a2)),y2=cy+r*Math.sin(toRad(a2)); const xi1=cx+ri*Math.cos(toRad(a2)),yi1=cy+ri*Math.sin(toRad(a2)); const xi2=cx+ri*Math.cos(toRad(a1)),yi2=cy+ri*Math.sin(toRad(a1)); const large=a2-a1>180?1:0; return `M ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} L ${xi1} ${yi1} A ${ri} ${ri} 0 ${large} 0 ${xi2} ${yi2} Z`;}
-  vals.forEach((v,i)=>{const end=start+v/total*360;paths+=`<path d="${arc(start,end)}" fill="${cols[i]}"/>`;start=end;});
-  return `<svg class="chart-svg" viewBox="0 0 320 200"><g transform="translate(0 0)">${paths}</g><text x="160" y="95" text-anchor="middle" font-size="21" font-weight="800" fill="#0d1730">—</text><text x="160" y="112" text-anchor="middle" font-size="9" fill="#7a8798">sample</text></svg>`;
+  mix.forEach((x,i)=>{const end=start+x.n/total*359.99;paths+=`<path d="${arc(start,end)}" fill="${cols[i%cols.length]}"/>`;start=end;});
+  const legend = mix.map((x,i)=>`<span style="display:inline-block;margin:2px 8px 0 0;font-size:9px;color:#5b6b80"><span style="color:${cols[i%cols.length]}">●</span> ${x.reason} ${Math.round(100*x.n/total)}%</span>`).join('');
+  return `<svg class="chart-svg" viewBox="0 0 320 200"><g>${paths}</g><text x="160" y="95" text-anchor="middle" font-size="21" font-weight="800" fill="#0d1730">${total.toLocaleString('en-IN')}</text><text x="160" y="112" text-anchor="middle" font-size="9" fill="#7a8798">failed payments</text></svg><div>${legend}</div>`;
 }
 
 function paymentsPage(){
@@ -708,7 +743,7 @@ function paymentsPage(){
     const fm=state.filter==='all' || (state.filter==='high' ? p.prob>=80 : state.filter==='action' ? p.status==='Action needed' : p.status===state.filter);
     return match&&fm;
   }).slice(0,30);
-  return `<div class="section-row"><div><div class="section-title">Failed payments</div><div class="section-sub">Every failure is scored, explained and assigned a next-best recovery action.</div></div><div class="table-controls"><input class="search" id="payment-search" value="${state.search}" placeholder="Search payment, customer…"/><select class="filter-btn" id="payment-filter"><option value="all">All</option><option value="high">High probability</option><option value="action">Action needed</option><option value="Pending">Pending</option><option value="Recovered">Recovered</option></select></div></div>
+  return `<div class="section-row"><div><div class="section-title">Failed payments</div><div class="section-sub">Every failure is scored, explained and assigned a next-best recovery action.</div></div><div class="table-controls"><input class="search" id="payment-search" value="${state.search}" placeholder="Search payment, customer…"/><select class="filter-btn" id="payment-filter"><option value="all">All</option><option value="high">High probability</option><option value="action">Action needed</option><option value="Pending">Pending</option><option value="Recovered">Recovered</option></select><button class="outline-btn" id="import-btn" title="CSV with the columns in data/sample_failed_payments.csv">Import CSV</button><input type="file" id="import-file" accept=".csv,text/csv" style="display:none"/></div></div>
   <div class="alert-strip"><span>✦</span><div><strong>${state.payments.filter(p=>p.prob>=80 && p.status!=='Recovered').length} payments</strong> are high-confidence recovery candidates. The agent can safely automate them under your current policy.</div><button class="link-btn" data-route="settings">Review policy →</button></div>
   <div class="card table-card">${paymentTable(filtered,false)}</div>`;
 }
@@ -722,7 +757,7 @@ function agentPage(){
   const on = state.policy.auto_recovery;
   const feed = (state.events || []).slice(0, 6).map(e =>
     feedItem(e.time, e.title, e.detail)).join('') || '<div class="empty">No agent activity yet.</div>';
-  return `<div class="agent-layout"><div class="card agent-big"><div class="agent-head"><div><div class="section-title">Recovery agent</div><div class="section-sub">Decisions follow the policy; outcomes are simulated</div></div><span class="pill ${on?'green':''}">${on?'ENABLED':'PAUSED'}</span></div><div class="agent-orb">✦</div><div class="agent-state"><strong>${on?'Agent runs when you start a cycle':'Agent is paused'}</strong><p>${(m.openFailures||0).toLocaleString('en-IN')} open failures · ${(m.actionable||0).toLocaleString('en-IN')} with an action queued · each cycle acts on up to ${state.policy.agent_batch_size} by expected value</p></div><div class="agent-kpis">${mini('Open failures',(m.openFailures||0).toLocaleString('en-IN'))}${mini('Awaiting approval',(m.awaitingApproval||0).toLocaleString('en-IN'))}${mini('Recovered value',money(m.recovered||0))}</div><div class="agent-actions"><button class="btn-ghost" id="agent-pause">${on?'Pause agent':'Resume agent'}</button><button class="btn-green" id="agent-run" ${on?'':'disabled'}>Run recovery cycle</button></div></div><div class="card feed"><div class="section-title">Agent activity</div><div class="section-sub">Latest logged decisions and outcomes</div><div style="margin-top:18px">${feed}</div></div></div>
+  return `<div class="agent-layout"><div class="card agent-big"><div class="agent-head"><div><div class="section-title">Recovery agent</div><div class="section-sub">Decisions follow the policy; outcomes are simulated</div></div><span class="pill ${on?'green':''}">${on?'ENABLED':'PAUSED'}</span></div><div class="agent-orb">✦</div><div class="agent-state"><strong>${on?'Agent runs when you start a cycle':'Agent is paused'}</strong><p>${(m.openFailures||0).toLocaleString('en-IN')} open failures · ${(m.actionable||0).toLocaleString('en-IN')} with an action queued · each cycle acts on up to ${state.policy.agent_batch_size} by expected value</p></div><div class="agent-kpis">${mini('Open failures',(m.openFailures||0).toLocaleString('en-IN'))}${mini('Awaiting approval',(m.awaitingApproval||0).toLocaleString('en-IN'))}${mini('Recovered value',money(m.recovered||0))}</div><div class="agent-actions"><button class="btn-ghost" id="agent-pause">${on?'Pause agent':'Resume agent'}</button><button class="btn-green" id="agent-run" ${on?'':'disabled'}>Run recovery cycle</button><button class="btn-ghost" id="agent-retrain">Retrain on ${state.analytics.attempts.logged} logged attempts</button></div></div><div class="card feed"><div class="section-title">Agent activity</div><div class="section-sub">Latest logged decisions and outcomes</div><div style="margin-top:18px">${feed}</div></div></div>
     <div class="section-row"><div><div class="section-title">What the agent considers</div><div class="section-sub">Inputs to the model and the rules around it.</div></div></div>
     <div class="metric-grid">${signalCard('Failure reason','Temporary vs. customer-fixable failures','Timeouts, bank declines, expired cards')}${signalCard('Customer history','Past payment count and success rate','Used as model features')}${signalCard('Action and timing','Expected value of each retry delay or customer request','Highest expected value wins')}${signalCard('Policy','High-value payments need approval','Above ₹'+state.policy.high_value_threshold.toLocaleString('en-IN'))}</div>`;
 }
@@ -731,9 +766,16 @@ function feedItem(time,title,copy){return `<div class="feed-item"><span class="f
 function signalCard(t,h,d){return `<div class="metric-card"><div class="metric-top"><span>${t}</span><span class="pill green">AI</span></div><div style="font-weight:800;font-size:11px;margin-top:10px">${h}</div><div style="font-size:9px;color:#7b8798;margin-top:5px;line-height:1.45">${d}</div></div>`}
 
 function simulatorPage(){
-  const s=state.sim; const total=s.transactions*s.avgAmount; const failed=total*s.failRate/100; const recovered=failed*s.recoverRate/100; const current=failed*.18; const upside=Math.max(0,recovered-current);
-  return `<div class="section-row"><div><div class="section-title">Recovery simulator</div><div class="section-sub">Model the revenue upside from intelligent recovery before connecting production data.</div></div><span class="pill green">Scenario mode</span></div><div class="sim-grid"><div class="card sim-card"><div class="section-title">Merchant inputs</div><div class="section-sub">Adjust the assumptions to see the impact.</div>${slider('Monthly transactions','transactions',s.transactions,10000,300000,10000,n=>n.toLocaleString('en-IN'))}${slider('Average payment','avgAmount',s.avgAmount,300,10000,100,n=>money(n))}${slider('Payment failure rate','failRate',s.failRate,2,15,.5,n=>n+'%')}${slider('AI recovery rate','recoverRate',s.recoverRate,20,90,1,n=>n+'%')}</div><div class="sim-result"><h3>Estimated monthly upside</h3><div class="sim-big">${money(upside)}</div><div class="sim-label">additional revenue recovered beyond your current baseline</div><div class="sim-bars"><div class="bar-line"><span>Current recovery</span><div class="bar-track"><div class="bar-fill current" style="width:${Math.min(100,current/failed*100)}%"></div></div><strong>${money(current)}</strong></div><div class="bar-line"><span>With RecoverAI</span><div class="bar-track"><div class="bar-fill recover" style="width:${Math.min(100,recovered/failed*100)}%"></div></div><strong>${money(recovered)}</strong></div></div><div class="roi-box"><strong>${money(failed)}</strong><p>revenue entering the failure pool each month · ${s.failRate}% failure rate across ${s.transactions.toLocaleString('en-IN')} payments</p></div></div></div>`;
+  const s=state.sim, bt=state.backtest;
+  const total=s.transactions*s.avgAmount, failed=total*s.failRate/100;
+  const naive=bt?bt.strategies.naive.recovered_value_pct:null, rules=bt?bt.strategies.rules.recovered_value_pct:null, ai=bt?bt.strategies.recoverai.recovered_value_pct:null;
+  const out = bt ? (() => {
+    const cur=failed*naive/100, rl=failed*rules/100, rec=failed*ai/100;
+    return `<div class="sim-result"><h3>Estimated monthly upside vs. naive retry</h3><div class="sim-big">${money(Math.max(0,rec-cur))}</div><div class="sim-label">extra value recovered, using recovery rates measured in the simulated backtest</div><div class="sim-bars">${bar('Naive retry ('+naive+'%)',cur,failed,'current')}${bar('Hand-written rules ('+rules+'%)',rl,failed,'current')}${bar('RecoverAI ('+ai+'%)',rec,failed,'recover')}</div><div class="roi-box"><strong>${money(failed)}</strong><p>failed value per month at ${s.failRate}% failure across ${s.transactions.toLocaleString('en-IN')} payments. Rates come from reports/backtest.json (${bt.setup.test_payments.toLocaleString('en-IN')} simulated payments, high-value excluded); they are not production results.</p></div></div>`;
+  })() : '<div class="sim-result"><h3>No backtest report</h3><p>Run <code>python -m backend.backtest</code> to generate reports/backtest.json.</p></div>';
+  return `<div class="section-row"><div><div class="section-title">Recovery simulator</div><div class="section-sub">Scale the backtest's recovery rates to your own volume.</div></div><span class="pill green">Scenario mode</span></div><div class="sim-grid"><div class="card sim-card"><div class="section-title">Merchant inputs</div><div class="section-sub">Adjust the volume assumptions.</div>${slider('Monthly transactions','transactions',s.transactions,10000,300000,10000,n=>n.toLocaleString('en-IN'))}${slider('Average payment','avgAmount',s.avgAmount,300,10000,100,n=>money(n))}${slider('Payment failure rate','failRate',s.failRate,2,15,.5,n=>n+'%')}</div>${out}</div>`;
 }
+function bar(label,val,failed,cls){return `<div class="bar-line"><span>${label}</span><div class="bar-track"><div class="bar-fill ${cls}" style="width:${Math.min(100,val/failed*100)}%"></div></div><strong>${money(val)}</strong></div>`}
 function slider(label,key,val,min,max,step,fmt){return `<div class="form-row"><div class="form-label"><span>${label}</span><strong id="${key}-value">${fmt(val)}</strong></div><input class="slider" type="range" min="${min}" max="${max}" step="${step}" value="${val}" data-sim="${key}"/></div>`}
 
 function settingsPage(){
@@ -750,6 +792,9 @@ function bindPageEvents(){
   const filter=document.querySelector('#payment-filter'); if(filter){filter.value=state.filter;filter.onchange=e=>{state.filter=e.target.value;render()}}
   document.querySelectorAll('[data-toggle]').forEach(btn=>btn.onclick=()=>setAutoRecovery(!state.policy.auto_recovery));
   document.querySelectorAll('[data-sim]').forEach(input=>input.oninput=e=>{state.sim[e.target.dataset.sim]=Number(e.target.value);render()});
+  const ib=document.querySelector('#import-btn'), inf=document.querySelector('#import-file');
+  if(ib&&inf){ib.onclick=()=>inf.click(); inf.onchange=()=>{if(inf.files[0]) importCsv(inf.files[0]);};}
+  const retrain=document.querySelector('#agent-retrain'); if(retrain) retrain.onclick=retrainModel;
   const run=document.querySelector('#agent-run'); if(run) run.onclick=runAgentCycle;
   const pause=document.querySelector('#agent-pause'); if(pause) pause.onclick=()=>setAutoRecovery(!state.policy.auto_recovery);
   const simulateEvent =
@@ -759,6 +804,24 @@ if(simulateEvent){
 
   simulateEvent.onclick = simulatePayment;
 }
+}
+async function importCsv(file){
+  try{
+    const text = await file.text();
+    const r = await api('/payments/import',{method:'POST',body:text,headers:{'Content-Type':'text/csv'}});
+    await syncFromBackend();
+    toast(`Imported ${r.imported} payments (${r.skipped_duplicates} duplicates skipped).`);
+  }catch(e){toast(`Import failed: ${e.message}`);}
+}
+async function retrainModel(){
+  toast('Retraining the model…');
+  try{
+    const r = await api('/model/retrain',{method:'POST'});
+    await syncFromBackend();
+    toast(r.retrained
+      ? `Retrained on ${r.logged_attempts} logged attempts. AUC ${r.before.roc_auc} → ${r.after.roc_auc}, Brier ${r.before.brier_score} → ${r.after.brier_score}.`
+      : r.reason);
+  }catch(e){toast(`Retrain failed: ${e.message}`);}
 }
 async function setAutoRecovery(on){
   try{

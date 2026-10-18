@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = ROOT / "recoverai.db"
+DB_PATH = Path(os.environ.get("RECOVERAI_DB", ROOT / "recoverai.db"))
 
 
 def get_conn() -> sqlite3.Connection:
@@ -49,6 +50,27 @@ def init_db() -> None:
             detail TEXT NOT NULL,
             amount REAL NOT NULL DEFAULT 0,
             metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        -- One row per recovery attempt with the features the model sees, so the model can be
+        -- retrained on what the app itself logged.
+        CREATE TABLE IF NOT EXISTS attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            payment_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            action TEXT NOT NULL,
+            delay_h REAL NOT NULL,
+            attempt_no INTEGER NOT NULL,
+            success INTEGER NOT NULL,
+            failure_reason TEXT NOT NULL,
+            payment_method TEXT NOT NULL,
+            amount REAL NOT NULL,
+            customer_previous_payments REAL NOT NULL,
+            customer_success_rate REAL NOT NULL,
+            hour INTEGER NOT NULL,
+            dow INTEGER NOT NULL,
+            dom INTEGER NOT NULL
         );
         """
     )
@@ -153,5 +175,24 @@ def clear_demo_data() -> None:
 
     seed_from_dataset(conn)
 
+    conn.commit()
+    conn.close()
+
+def log_attempt(row: dict, source: str, action_kind: str, delay_h: float,
+                attempt_no: int, success: bool, when) -> None:
+    """Store one attempt (and its features) for later retraining. `when` is the IST time of the attempt."""
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO attempts(payment_id, source, action, delay_h, attempt_no, success,
+            failure_reason, payment_method, amount, customer_previous_payments,
+            customer_success_rate, hour, dow, dom)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (row["payment_id"], source, action_kind, float(delay_h), int(attempt_no), int(success),
+         row["failure_reason"], row["payment_method"], float(row["amount"]),
+         float(row["customer_previous_payments"]), float(row["customer_success_rate"]),
+         int(when.hour), int(when.dayofweek), int(when.day)),
+    )
     conn.commit()
     conn.close()

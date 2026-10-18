@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import io
 import json
 import os
 import random
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .db import get_conn, init_db, insert_event
+from .db import get_conn, init_db, insert_event, log_attempt
 import numpy as np
 import pandas as pd
 
@@ -39,6 +43,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Optional API key: when RECOVERAI_API_KEY is set, every write request (POST) must send it in
+# the X-API-Key header. The webhook is exempt because it is authenticated by an HMAC signature.
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    key = os.environ.get("RECOVERAI_API_KEY")
+    path = request.url.path
+    if key and request.method == "POST" and path.startswith("/api/") \
+            and path != "/api/webhooks/outcome":
+        supplied = request.headers.get("x-api-key", "")
+        if not hmac.compare_digest(supplied, key):
+            return JSONResponse({"detail": "Missing or invalid API key"}, status_code=401)
+    return await call_next(request)
 
 
 # =========================================================
@@ -778,6 +796,12 @@ def payment_action(
 
     success = OUTCOME_RNG.random() < chance
 
+    log_attempt(
+        row, "simulated", ml_engine.LABEL_KIND.get(action, "retry"),
+        float(row.get("recommended_delay_h") or 0),
+        min(int(row["retry_count"]) + 1, sim.MAX_ATTEMPTS), success, sim.now_ist(),
+    )
+
     conn = get_conn()
 
     conn.execute(
@@ -1149,6 +1173,174 @@ def agent_cycle():
 # =========================================================
 # RESET DEMO
 # =========================================================
+
+# =========================================================
+# MODEL: RETRAIN FROM LOGGED ATTEMPTS
+# =========================================================
+
+@app.post("/api/model/retrain")
+def retrain_model():
+    """Retrain on simulated logs plus every attempt this app has logged, then rescore."""
+    return ml_engine.retrain_from_logged()
+
+
+# =========================================================
+# ANALYTICS (computed from the payments table)
+# =========================================================
+
+@app.get("/api/analytics")
+def analytics():
+    conn = get_conn()
+    daily = conn.execute(
+        """
+        SELECT substr(timestamp, 1, 10) AS day,
+               SUM(amount) AS failed_value,
+               SUM(recovered_value) AS recovered_value,
+               COUNT(*) AS n
+        FROM payments GROUP BY day ORDER BY day
+        """
+    ).fetchall()
+    mix = conn.execute(
+        """
+        SELECT failure_reason AS reason, COUNT(*) AS n, SUM(amount) AS value,
+               SUM(CASE WHEN status='recovered' THEN 1 ELSE 0 END) AS recovered
+        FROM payments GROUP BY failure_reason ORDER BY n DESC
+        """
+    ).fetchall()
+    attempts = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(success), 0) AS ok FROM attempts"
+    ).fetchone()
+    conn.close()
+    return {
+        "daily": [dict(r) for r in daily],
+        "failureMix": [dict(r) for r in mix],
+        "attempts": {"logged": attempts["n"], "succeeded": attempts["ok"]},
+    }
+
+
+@app.get("/api/backtest")
+def backtest_report():
+    """Results of `python -m backend.backtest` (simulated world), used by the simulator page."""
+    path = ROOT / "reports" / "backtest.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run python -m backend.backtest first")
+    return json.loads(path.read_text())
+
+
+# =========================================================
+# REAL DATA IN: CSV / JSON IMPORT AND SIGNED OUTCOME WEBHOOK
+# =========================================================
+
+IMPORT_COLUMNS = ["payment_id", "customer_id", "amount", "payment_method", "failure_reason",
+                  "timestamp", "customer_previous_payments", "customer_success_rate"]
+
+
+@app.post("/api/payments/import")
+async def import_payments(request: Request):
+    """Load your own failed payments (CSV body, or JSON list). Required columns:
+    payment_id, customer_id, amount, payment_method, failure_reason, timestamp,
+    customer_previous_payments, customer_success_rate. They are scored and become open failures."""
+    raw = (await request.body()).decode("utf-8-sig")
+    try:
+        if "json" in request.headers.get("content-type", ""):
+            df = pd.DataFrame(json.loads(raw))
+        else:
+            df = pd.read_csv(io.StringIO(raw))
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Could not parse input: {error}")
+
+    missing = [c for c in IMPORT_COLUMNS if c not in df.columns]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing columns: {', '.join(missing)}")
+    if df.empty or len(df) > 50000:
+        raise HTTPException(status_code=400, detail="Provide between 1 and 50,000 rows")
+    df = df[IMPORT_COLUMNS].copy()
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    df["customer_previous_payments"] = pd.to_numeric(df["customer_previous_payments"], errors="coerce")
+    df["customer_success_rate"] = pd.to_numeric(df["customer_success_rate"], errors="coerce")
+    ts = pd.to_datetime(df["timestamp"], errors="coerce")
+    bad = df["amount"].isna() | (df["amount"] <= 0) | df["customer_previous_payments"].isna() \
+        | df["customer_success_rate"].isna() | ~df["customer_success_rate"].between(0, 1) \
+        | ts.isna() | df["payment_id"].isna() | df["failure_reason"].isna() | df["payment_method"].isna()
+    if bad.any():
+        raise HTTPException(status_code=400, detail=f"{int(bad.sum())} rows have missing or invalid values "
+                            "(first bad row number: %d)" % (int(bad.to_numpy().argmax()) + 2))
+    df["timestamp"] = ts.dt.tz_localize(None) if ts.dt.tz is None else ts.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+
+    conn = get_conn()
+    existing = {r[0] for r in conn.execute("SELECT payment_id FROM payments")}
+    added = 0
+    for r in df.itertuples():
+        if str(r.payment_id) in existing:
+            continue
+        conn.execute(
+            """
+            INSERT INTO payments(payment_id, customer_id, amount, payment_method, timestamp, status,
+                failure_reason, customer_previous_payments, customer_success_rate, retry_count,
+                recovery_probability, recoverable_value, recovered_value, recommended_action,
+                recommended_delay_h)
+            VALUES(?,?,?,?,?, 'failed', ?,?,?, 0, 0.5, 0, 0, 'No action', 0)
+            """,
+            (str(r.payment_id), str(r.customer_id), float(r.amount), str(r.payment_method),
+             r.timestamp.tz_localize("Asia/Kolkata").isoformat(), str(r.failure_reason),
+             int(r.customer_previous_payments), float(r.customer_success_rate)),
+        )
+        added += 1
+    conn.commit()
+    conn.close()
+    if added:
+        ml_engine.rescore_payments()
+        insert_event("analysis", None, "Payments imported", f"{added} failed payments imported and scored", 0)
+    return {"imported": added, "skipped_duplicates": len(df) - added}
+
+
+class OutcomeWebhook(BaseModel):
+    payment_id: str
+    success: bool
+    action: str = "retry"
+    delay_hours: float = 0
+
+
+@app.post("/api/webhooks/outcome")
+async def outcome_webhook(request: Request):
+    """How a real gateway reports the result of a recovery attempt. The body must be signed:
+    header X-Signature = hex HMAC-SHA256 of the raw body using RECOVERAI_WEBHOOK_SECRET."""
+    secret = os.environ.get("RECOVERAI_WEBHOOK_SECRET")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Webhook disabled: set RECOVERAI_WEBHOOK_SECRET")
+    body = await request.body()
+    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, request.headers.get("x-signature", "")):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    try:
+        data = OutcomeWebhook.model_validate_json(body)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    if data.action not in sim.ACTIONS:
+        raise HTTPException(status_code=400, detail=f"action must be one of {sim.ACTIONS}")
+
+    row = payment_record(data.payment_id)
+    if row["status"] == "recovered":
+        return {"ok": True, "result": "already_recovered"}
+
+    log_attempt(row, "webhook", data.action, data.delay_hours,
+                min(int(row["retry_count"]) + 1, sim.MAX_ATTEMPTS), data.success, sim.now_ist())
+    conn = get_conn()
+    conn.execute("UPDATE payments SET retry_count = retry_count + 1 WHERE payment_id=?", (data.payment_id,))
+    if data.success:
+        conn.execute(
+            "UPDATE payments SET status='recovered', recovered_value=amount, recoverable_value=0 WHERE payment_id=?",
+            (data.payment_id,))
+    conn.commit()
+    conn.close()
+    insert_event(
+        "success" if data.success else "retry_failed", data.payment_id,
+        "Payment recovered" if data.success else "Recovery attempt failed",
+        f"{data.payment_id} · {data.action} · reported by gateway webhook",
+        row["amount"], {"source": "webhook", "action": data.action},
+    )
+    return {"ok": True, "result": "recovered" if data.success else "retry_failed"}
+
 
 @app.post("/api/demo/reset")
 def reset_demo():

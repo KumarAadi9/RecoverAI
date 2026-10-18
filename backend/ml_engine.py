@@ -98,7 +98,9 @@ def _calibration_table(y: np.ndarray, p: np.ndarray, bins: int = 10) -> list[dic
     return out
 
 
-def train_model() -> None:
+def train_model(extra: pd.DataFrame | None = None) -> None:
+    """Train on the simulated logs; `extra` optionally adds attempts logged by the app itself
+    (same columns as simulation.attempt_frame plus `success`)."""
     global MODEL, MODEL_INFO
     payments = sim.generate_failures(N_TRAIN_PAYMENTS, seed=TRAIN_SEED, days=TRAIN_DAYS)
     logs = sim.simulate_logged_attempts(payments, seed=TRAIN_SEED + 1)
@@ -111,7 +113,13 @@ def train_model() -> None:
         max_iter=250, learning_rate=0.08, max_leaf_nodes=31,
         categorical_features=_CAT_MASK, random_state=0,
     )
-    model.fit(X[is_train], y[is_train])
+    X_fit, y_fit = X[is_train], y[is_train]
+    n_extra = 0
+    if extra is not None and len(extra):
+        X_fit = np.vstack([X_fit, encode(extra)])
+        y_fit = np.concatenate([y_fit, extra["success"].to_numpy()])
+        n_extra = len(extra)
+    model.fit(X_fit, y_fit)
     MODEL = model
 
     p = model.predict_proba(X[~is_train])[:, 1]
@@ -123,7 +131,8 @@ def train_model() -> None:
         "data": "Simulated attempt logs (backend/simulation.py). No real payment data.",
         "split": f"time-based: payments from the first {SPLIT_DAY} days train, the last "
                  f"{TRAIN_DAYS - SPLIT_DAY} days are held out",
-        "training_attempts": int(is_train.sum()),
+        "training_attempts": int(is_train.sum()) + n_extra,
+        "logged_attempts_used": n_extra,
         "validation_attempts": int((~is_train).sum()),
         "features": FEATURES,
         "roc_auc": round(float(roc_auc_score(y_test, p)), 3),
@@ -266,3 +275,24 @@ def rescore_payments() -> int:
     conn.commit()
     conn.close()
     return len(updates)
+
+
+def retrain_from_logged() -> dict:
+    """Retrain with the attempts stored in the `attempts` table added to the simulated logs, then
+    rescore open payments. Returns metrics before and after on the same held-out simulated test set."""
+    ensure_model()
+    before = {k: MODEL_INFO[k] for k in ("roc_auc", "pr_auc", "brier_score")}
+    conn = get_conn()
+    rows = pd.read_sql_query("SELECT * FROM attempts", conn)
+    conn.close()
+    if rows.empty:
+        return {"retrained": False, "reason": "No logged attempts yet. Run a recovery cycle first.",
+                "logged_attempts": 0, "before": before}
+    extra = rows.rename(columns={"action": "action"})[[
+        "failure_reason", "payment_method", "amount", "customer_previous_payments",
+        "customer_success_rate", "attempt_no", "action", "delay_h", "hour", "dow", "dom", "success"]]
+    train_model(extra)
+    rescored = rescore_payments()
+    after = {k: MODEL_INFO[k] for k in ("roc_auc", "pr_auc", "brier_score")}
+    return {"retrained": True, "logged_attempts": int(len(extra)), "rescored": rescored,
+            "before": before, "after": after}
