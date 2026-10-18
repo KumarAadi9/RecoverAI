@@ -743,7 +743,7 @@ function paymentsPage(){
     const fm=state.filter==='all' || (state.filter==='high' ? p.prob>=80 : state.filter==='action' ? p.status==='Action needed' : p.status===state.filter);
     return match&&fm;
   }).slice(0,30);
-  return `<div class="section-row"><div><div class="section-title">Failed payments</div><div class="section-sub">Every failure is scored, explained and assigned a next-best recovery action.</div></div><div class="table-controls"><input class="search" id="payment-search" value="${state.search}" placeholder="Search payment, customer…"/><select class="filter-btn" id="payment-filter"><option value="all">All</option><option value="high">High probability</option><option value="action">Action needed</option><option value="Pending">Pending</option><option value="Recovered">Recovered</option></select></div></div>
+  return `<div class="section-row"><div><div class="section-title">Failed payments</div><div class="section-sub">Every failure is scored, explained and assigned a next-best recovery action.</div></div><div class="table-controls"><input class="search" id="payment-search" value="${state.search}" placeholder="Search payment, customer…"/><select class="filter-btn" id="payment-filter"><option value="all">All</option><option value="high">High probability</option><option value="action">Action needed</option><option value="Pending">Pending</option><option value="Recovered">Recovered</option></select><button class="outline-btn" id="import-btn" title="CSV with the columns in data/sample_failed_payments.csv">Import CSV</button><input type="file" id="import-file" accept=".csv,text/csv" style="display:none"/></div></div>
   <div class="alert-strip"><span>✦</span><div><strong>${state.payments.filter(p=>p.prob>=80 && p.status!=='Recovered').length} payments</strong> are high-confidence recovery candidates. The agent can safely automate them under your current policy.</div><button class="link-btn" data-route="settings">Review policy →</button></div>
   <div class="card table-card">${paymentTable(filtered,false)}</div>`;
 }
@@ -792,6 +792,8 @@ function bindPageEvents(){
   const filter=document.querySelector('#payment-filter'); if(filter){filter.value=state.filter;filter.onchange=e=>{state.filter=e.target.value;render()}}
   document.querySelectorAll('[data-toggle]').forEach(btn=>btn.onclick=()=>setAutoRecovery(!state.policy.auto_recovery));
   document.querySelectorAll('[data-sim]').forEach(input=>input.oninput=e=>{state.sim[e.target.dataset.sim]=Number(e.target.value);render()});
+  const ib=document.querySelector('#import-btn'), inf=document.querySelector('#import-file');
+  if(ib&&inf){ib.onclick=()=>inf.click(); inf.onchange=()=>{if(inf.files[0]) importCsv(inf.files[0]);};}
   const retrain=document.querySelector('#agent-retrain'); if(retrain) retrain.onclick=retrainModel;
   const run=document.querySelector('#agent-run'); if(run) run.onclick=runAgentCycle;
   const pause=document.querySelector('#agent-pause'); if(pause) pause.onclick=()=>setAutoRecovery(!state.policy.auto_recovery);
@@ -802,6 +804,14 @@ if(simulateEvent){
 
   simulateEvent.onclick = simulatePayment;
 }
+}
+async function importCsv(file){
+  try{
+    const text = await file.text();
+    const r = await api('/payments/import',{method:'POST',body:text,headers:{'Content-Type':'text/csv'}});
+    await syncFromBackend();
+    toast(`Imported ${r.imported} payments (${r.skipped_duplicates} duplicates skipped).`);
+  }catch(e){toast(`Import failed: ${e.message}`);}
 }
 async function retrainModel(){
   toast('Retraining the model…');
