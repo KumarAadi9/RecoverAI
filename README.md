@@ -100,7 +100,7 @@ Open http://localhost:8000. On first start the app seeds 5,000 simulated failed 
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                         # unit and behaviour tests
+pytest                         # 24 unit and behaviour tests
 python -m backend.backtest     # regenerates reports/ (about 30 seconds)
 ```
 
@@ -118,9 +118,29 @@ python -m backend.backtest     # regenerates reports/ (about 30 seconds)
 | `reports/` | Backtest results and charts |
 | `tests/` | pytest suite |
 
+## Using your own data
+
+- **Import failed payments:** use the **Import CSV** button on the dashboard, or call the API: `curl -X POST localhost:8000/api/payments/import -H "content-type: text/csv" --data-binary @data/sample_failed_payments.csv`. Required columns are in `data/sample_failed_payments.csv`; rows are validated, scored and added as open failures.
+- **Report real outcomes:** a gateway (or a script) posts `{"payment_id", "success", "action", "delay_hours"}` to `/api/webhooks/outcome` with header `X-Signature` = hex HMAC-SHA256 of the raw body using `RECOVERAI_WEBHOOK_SECRET`. The payment is updated and the attempt is logged.
+- **Learn from outcomes:** every attempt is stored in the `attempts` table. `POST /api/model/retrain` (or the "Retrain" button on the agent page) refits the model on the simulated logs plus those attempts and shows AUC and Brier before and after, measured on the same held-out simulated test set.
+
+## Configuration
+
+| Variable | Effect |
+|---|---|
+| `RECOVERAI_API_KEY` | If set, every POST under `/api/` needs the `X-API-Key` header (the dashboard asks for it once). |
+| `RECOVERAI_WEBHOOK_SECRET` | Enables the signed outcome webhook. |
+| `RECOVERAI_DB` | SQLite file path (default `recoverai.db`). |
+| `RECOVERAI_SEED` | Makes simulated outcomes reproducible. |
+
+Docker: `docker build -t recoverai . && docker run -p 8000:8000 -v recoverai-data:/data recoverai`. CI runs the tests on every push (`.github/workflows/tests.yml`).
+
 ## Limitations
 
-- **Simulated data and outcomes.** The world's rules are my assumptions (for example that expired cards never recover on retry and that salary timing matters). The model recovers them, so part of its advantage is structural. Real data could behave differently.
+- **Docker image and CI workflow are written but I have not run them yet.**
+- **Simulated data and outcomes by default.** The world's rules are my assumptions (for example that expired cards never recover on retry and that salary timing matters). The model recovers them, so part of its advantage is structural. Real data could behave differently. The import and webhook paths accept real data, but I have not run the model on any.
+- **No real payment gateway integration.** The "Execute action" step samples an outcome from the simulated world. The webhook is the interface a real gateway would use; no gateway adapter is included or tested.
+- **Retraining caveat.** Logged attempts in the demo come from the simulator, so retraining on them mostly reproduces the same world.
 - **Assumed costs.** A retry costs ₹3 and a customer request ₹20 in the expected-value calculation; these are placeholders.
-- **Dashboard numbers.** Revenue at risk, recoverable value, recovered value and recovery rate are computed from the payments table (recoverable is the model's expected value, not a promise). The only editable policy setting is the automatic-recovery switch; the dashboard's simulator page and its charts (trend and failure-mix on the overview) still show illustrative sample data, and everything is simulated.
-- No authentication, and CORS is open; this is a local prototype.
+- **Dashboard numbers** (at risk, recoverable, recovered, rate, trend, failure mix, simulator) are computed from the payments table or reports/backtest.json. Recoverable is the model's expected value, not a promise.
+- SQLite and a single shared API key: fine for a demo, not for multi-tenant production. CORS is open.
